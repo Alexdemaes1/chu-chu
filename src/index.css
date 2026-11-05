@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #f3f6fa;
+  color: #243247;
+}
+
+/* Light, low-glare workspace palette. Keep the existing utility classes so
+   status colors and component structure remain easy to maintain. */
+#root [class*="bg-slate-950"] { background-color: #f1f4f8 !important; }
+#root [class*="bg-slate-900"] { background-color: #ffffff !important; }
+#root [class*="bg-slate-800"] { background-color: #e9eef4 !important; }
+#root [class*="bg-slate-700"] { background-color: #dce4ed !important; }
+#root [class~="text-white"] { color: #172438 !important; }
+#root [class*="text-slate-100"] { color: #1e293b !important; }
+#root [class*="text-slate-200"] { color: #334155 !important; }
+#root [class*="text-slate-300"] { color: #3f5066 !important; }
+#root [class*="text-slate-400"] { color: #596b82 !important; }
+#root [class*="text-slate-500"] { color: #718096 !important; }
+#root [class*="border-slate-800"] { border-color: #dce3ec !important; }
+#root [class*="border-slate-700"] { border-color: #cbd5e1 !important; }
+#root [class*="text-cyan-300"], #root [class*="text-cyan-400"] { color: #087e9b !important; }
+#root [class*="text-amber-300"], #root [class*="text-amber-400"] { color: #a45d08 !important; }
+#root [class*="text-emerald-300"], #root [class*="text-emerald-400"] { color: #087752 !important; }
+#root [class*="text-pink-300"], #root [class*="text-pink-400"] { color: #b42366 !important; }
+#root [class*="bg-cyan-950"] { background-color: #d9f1f5 !important; }
+#root [class*="bg-amber-950"] { background-color: #fff3d6 !important; }
+#root [class*="bg-emerald-950"] { background-color: #dff3e9 !important; }
+#root [class*="bg-pink-950"] { background-color: #fbe3ef !important; }
+#root [class*="bg-rose-950"] { background-color: #fee5e7 !important; }
+
+/* Custom scrollbars for industrial density */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #eef2f7;
+}
+::-webkit-scrollbar-thumb {
+  background: #c5cfdb;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
