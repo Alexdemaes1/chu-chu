@@ -10,8 +10,10 @@
 
 import {
   type CustomEquationsConfig,
+  SAFE_DEFAULT_EQUATIONS,
   evaluateCustomSoderberg,
   evaluateCustomBladeHeight,
+  finiteOr,
   safeEvaluateMath,
 } from './customEquations';
 
@@ -89,7 +91,13 @@ export interface TurbineInputs {
   rowConfiguration?: 'normal' | 'counterrotating';
   phi?: number;       // Flow coefficient (optional, default auto-sized ~0.55-0.65)
   direction?: 1 | -1; // Rotation direction (+1 or -1)
-  inletSwirlOverride?: number; // Forced inlet swirl V_theta1 from previous stage
+  inletSwirlOverride?: number; // Forced inlet swirl V_theta1 from previous stage (fila sin estator)
+  /**
+   * Remolino absoluto a la entrada del estator, V_θ0 [m/s], con el signo global de las velocidades
+   * tangenciales. Por defecto 0 (entrada axial). Solo afecta a filas con estator: fija α₀, la deflexión
+   * del estator y el estado estático de la estación 1.
+   */
+  statorInletSwirl?: number;
   gasKey?: keyof typeof GAS_PRESETS;
   customGamma?: number;
   customCp?: number;
@@ -169,6 +177,11 @@ export interface MultiStageOutputs {
   dh_actual_overall: number;
   reheatFactor: number;
   eta_overall_tt: number;
+  /**
+   * Overall total-to-static efficiency: actual work / isentropic drop from P01, T01 to the
+   * static pressure at the last rotor exit (same definition as the per-stage eta_ts).
+   */
+  eta_overall_ts: number;
   power_total_kW: number;
   power_total_MW: number;
   net_torque_Nm: number;
@@ -212,10 +225,14 @@ export interface TurbineOutputs {
   T03_is: number;       // Isentropic total exit temperature [K]
   T03_actual: number;   // Actual total exit temperature [K]
   P03: number;          // Total exit pressure [Pa]
-  T1_static: number;    // Stator inlet static temperature [K]
+  T1_static: number;    // Stator inlet static temperature [K], con V₀² = Va² + V_θ0² (sin estator, igual a T2)
   P1_static: number;    // Stator inlet static pressure [Pa]
   T2_static: number;    // Rotor inlet static temperature [K]
-  P2_static: number;    // Rotor inlet static pressure [Pa]
+  /**
+   * Presión estática a la salida del estator / entrada del rotor [Pa]. Incluye la pérdida del
+   * estator del modelo activo: T2s = T2 − Δh_loss,N/cp y P2 = P01·(T2s/T01)^(γ/(γ−1)).
+   */
+  P2_static: number;
   T3_static: number;    // Rotor exit static temperature [K]
   P3_static: number;    // Rotor exit static pressure [Pa]
   rho3_static: number;  // Rotor exit static density [kg/m³]
@@ -256,14 +273,14 @@ export interface TurbineOutputs {
   // Dimensional & Dimensionless Parameters
   Ns: number;           // Balje Specific Speed (rad-based): omega * sqrt(Q3) / (dh_is^0.75)
   Ds: number;           // Balje Specific Diameter: D * dh_is^0.25 / sqrt(Q3)
-  annulusArea: number;  // Required annulus flow area [m²]
-  bladeHeight: number;  // Mean blade height [m]
-  bladeHeight_mm: number;// Mean blade height [mm]
+  annulusArea: number;  // Annulus flow area at the rotor exit (estación 3) [m²]
+  bladeHeight: number;  // Blade height at the rotor exit (estación 3) [m]
+  bladeHeight_mm: number;// Blade height at the rotor exit (estación 3) [mm]
   geometryLossIterations: number;
   geometryLossConverged: boolean;
-  hubRadius: number;    // Hub radius [m]
-  tipRadius: number;    // Tip radius [m]
-  hubToTipRatio: number;// Rh / Rt
+  hubRadius: number;    // Hub radius at the rotor exit (estación 3) [m]
+  tipRadius: number;    // Tip radius at the rotor exit (estación 3) [m]
+  hubToTipRatio: number;// Rh / Rt at the rotor exit (estación 3)
 
   // Power & Mechanics
   power_kW: number;     // Turbine shaft power [kW]
@@ -299,11 +316,13 @@ export function deg2rad(deg: number): number {
  * 1. Soderberg's Loss Model (1949)
  * 
  * Based on empirical correlations for axial turbine cascades (Dixon & Hall section 3.5, Horlock):
- * - Nominal enthalpy loss coefficient:
- *     zeta_ref = 0.04 + 0.06 * (epsilon / 100)^2 - 0.006 * ((t/c) / 0.20)
+ * - Nominal enthalpy loss coefficient (t/c = 0.20, Re = 1e5, AR = 3):
+ *     zeta_ref = 0.04 + 0.06 * (epsilon / 100)^2
+ *   (forma editable: a + b·(ε/100)^c − tk·(t/c)/0.20, con tk = 0 por defecto)
  * - Aspect ratio correction:
  *     Stator: (1 + zeta_ref) * (0.993 + 0.021 / AR) - 1
  *     Rotor:  (1 + zeta_ref) * (0.975 + 0.075 / AR) - 1
+ * - Stator deflection: epsilon_N = |alpha1 - alpha0|; rotor deflection: epsilon_R = |beta2 - beta1|
  * - Stator loss: Delta_h_stator = zeta_N * (1/2) * V1^2
  * - Rotor loss: Delta_h_rotor = zeta_R * (1/2) * W2^2
  */
@@ -347,7 +366,6 @@ export function calculateSoderbergLosses(params: {
 
   const zeta_N_nominal = customN.zeta_nominal;
   const zeta_R_nominal = customR.zeta_nominal;
-  const arFactor = customR.arFactor;
   const zeta_N = isVaneless ? 0 : customN.zeta_final;
   const zeta_R = customR.zeta_final;
 
@@ -380,15 +398,38 @@ export function calculateSoderbergLosses(params: {
 }
 
 /**
+ * Convierte un coeficiente de pérdida de presión total Y = (p₀₁ − p₀₂)/(p₀₂ − p₂) en el coeficiente de
+ * pérdida de entalpía ζ = (h₂ − h₂s)/(½V₂²) de la misma rejilla, con la relación exacta de gas ideal
+ * en el Mach de salida M (absoluto en el estator, relativo en el rotor):
+ *   r = (1 + ½(γ−1)M²)^(γ/(γ−1)) = p₀₂/p₂;   p₀₁/p₂ = r + Y(r − 1)
+ *   T₂/T₀ = 1/(1 + ½(γ−1)M²);   T₂s/T₀ = (p₂/p₀₁)^((γ−1)/γ)
+ *   ζ = (T₂/T₀ − T₂s/T₀)/(1 − T₂/T₀)
+ * Para M → 0 tiende a ζ = Y, que se devuelve directamente cuando M < 1e-3.
+ */
+export function ymToZeta(Y: number, M: number, gamma: number): number {
+  if (!(Y > 0)) return 0;
+  const mach = Math.abs(M);
+  if (!Number.isFinite(mach) || mach < 1e-3 || !(gamma > 1)) return Y;
+  const k = 0.5 * (gamma - 1) * mach * mach;
+  const r = Math.pow(1 + k, gamma / (gamma - 1));
+  const p01_over_p2 = r + Y * (r - 1);
+  const T2_over_T0 = 1 / (1 + k);
+  const T2s_over_T0 = Math.pow(1 / p01_over_p2, (gamma - 1) / gamma);
+  return Math.max(0, (T2_over_T0 - T2s_over_T0) / (1 - T2_over_T0));
+}
+
+/**
  * 2. Ainley & Mathieson Loss Model (1951, ARC R&M 2891)
- * 
+ *
  * Classic standard 1D method decomposing total pressure losses into:
- * - Profile loss Y_p (interpolated between nozzle beta1=0 and impulse beta1=beta2)
- * - Secondary endwall loss Y_s (aspect ratio and blade loading CL/(s/c))
+ * - Profile loss Y_p, interpolated between nozzle (ξ = 0) and impulse (ξ = 1) blading with the signed
+ *   impulse fraction ξ = clamp(−sgn(β₂)·β₁/max(1,|β₂|), 0, 1). An inlet angle on the same side as the
+ *   exit (reaction blading) gives ξ = 0, the conservative nozzle value.
+ * - Secondary endwall loss Y_s (aspect ratio, blade loading CL/(s/c) and the Dunham-Came factor
+ *   cos(exit)/cos(inlet))
  * - Tip clearance leakage loss Y_tc
- * 
- * Converted to enthalpy loss via:
- *   zeta = Y / (1 + 0.5 * (gamma - 1) * Mach^2)
+ *
+ * Converted to enthalpy loss with the exact gas relation ymToZeta(Y, M_exit, γ).
  */
 export function calculateAinleyMathiesonLosses(params: {
   alpha0_deg: number;
@@ -435,14 +476,16 @@ export function calculateAinleyMathiesonLosses(params: {
   const s_over_c = Math.max(0.45, Math.min(1.35, pitchToChord));
   const t_over_c = Math.max(0.10, Math.min(0.28, tmaxToChord));
 
-  // Custom equation parameters
+  // Custom equation parameters (validated: a corrupt value falls back to the canonical constant)
   const amConfig = customEquations?.ainleyMathieson;
-  const nozzleA = amConfig?.nozzleA ?? 0.025;
-  const nozzleB = amConfig?.nozzleB ?? 0.065;
-  const impulseA = amConfig?.impulseA ?? 0.075;
-  const impulseB = amConfig?.impulseB ?? 0.165;
-  const secondaryCoeff = amConfig?.secondaryCoeff ?? 0.033;
-  const B_tip = amConfig?.tipClearanceCoeff ?? 0.50;
+  const amDefaults = SAFE_DEFAULT_EQUATIONS.ainleyMathieson;
+  const useCustomFormula = amConfig?.useCustomFormula === true;
+  const nozzleA = finiteOr(amConfig?.nozzleA, amDefaults.nozzleA);
+  const nozzleB = finiteOr(amConfig?.nozzleB, amDefaults.nozzleB);
+  const impulseA = finiteOr(amConfig?.impulseA, amDefaults.impulseA);
+  const impulseB = finiteOr(amConfig?.impulseB, amDefaults.impulseB);
+  const secondaryCoeff = finiteOr(amConfig?.secondaryCoeff, amDefaults.secondaryCoeff);
+  const B_tip = finiteOr(amConfig?.tipClearanceCoeff, amDefaults.tipClearanceCoeff);
 
   // --- ROTOR LOSSES ---
   const b1_rad = deg2rad(beta1_deg);
@@ -452,6 +495,8 @@ export function calculateAinleyMathiesonLosses(params: {
   const tan_bm = 0.5 * (Math.tan(b1_rad) + Math.tan(b2_rad));
   const cos_bm = 1 / Math.sqrt(1 + tan_bm * tan_bm);
   const cos_b2 = Math.cos(b2_rad);
+  // Dunham-Came: Ys ∝ cos(salida)/cos(entrada)
+  const dunhamCameRotor = Math.abs(cos_b2) / Math.max(0.05, Math.abs(Math.cos(b1_rad)));
 
   // Aerodynamic Lift parameter: CL / (s/c) = 2 * |tan(beta1) - tan(beta2)| * cos(beta_m)
   const CL_over_sc = 2 * Math.abs(Math.tan(b1_rad) - Math.tan(b2_rad)) * cos_bm;
@@ -459,27 +504,31 @@ export function calculateAinleyMathiesonLosses(params: {
 
   // 1. Rotor Profile Loss Yp
   const abs_b2 = Math.abs(beta2_deg);
-  const abs_b1 = Math.abs(beta1_deg);
 
   const Yp_nozzle_base = nozzleA + nozzleB * Math.pow(abs_b2 / 100, 2.4) * Math.pow(s_over_c, -0.4);
   const Yp_impulse_base = impulseA + impulseB * Math.pow(abs_b2 / 100, 2.6) * Math.pow(s_over_c, -0.6);
 
-  const xi_R = Math.min(1.0, abs_b1 / Math.max(1.0, abs_b2));
+  // Signed impulse fraction: β₁ = −β₂ is pure impulse (ξ = 1), β₁ = 0 is a nozzle (ξ = 0). Inlet angles
+  // on the same side as the exit are reaction blading and take the nozzle value (ξ clipped to 0).
+  const xi_signed = (-(Math.sign(beta2_deg) || 1) * beta1_deg) / Math.max(1.0, abs_b2);
+  const xi_R = Math.max(0, Math.min(1, xi_signed));
   const Yp_base = Yp_nozzle_base + xi_R * xi_R * (Yp_impulse_base - Yp_nozzle_base);
   const defaultYpRotor = Yp_base * Math.pow(t_over_c / 0.20, xi_R);
-  const customYpRotor = amConfig?.useCustomFormula
+  const customYpRotor = useCustomFormula && amConfig
     ? safeEvaluateMath(amConfig.customYpExpression, {
         Yp_base, Yp_nozzle: Yp_nozzle_base, Yp_impulse: Yp_impulse_base,
-        xi: xi_R, t_over_c, s_over_c, beta1: b1_rad, beta2: b2_rad,
+        xi: xi_R, xi_signed, t_over_c, s_over_c, beta1: b1_rad, beta2: b2_rad,
         AR: aspectRatio, nozzleA, nozzleB, impulseA, impulseB,
       }, defaultYpRotor).value
     : defaultYpRotor;
   const Yp_rotor = Math.max(0.015, Math.min(0.25, customYpRotor));
 
-  // 2. Rotor Secondary Loss Ys
+  // 2. Rotor Secondary Loss Ys (Ainley-Mathieson with the Dunham-Came angle factor)
   const lambda_R = secondaryCoeff / aspectRatio;
-  const defaultYsRotor = lambda_R * Math.pow(CL_over_sc, 2) * ((cos_b2 * cos_b2) / Math.max(0.02, Math.pow(cos_bm, 3)));
-  const customYsRotor = amConfig?.useCustomFormula
+  const defaultYsRotor = lambda_R * Math.pow(CL_over_sc, 2)
+    * ((cos_b2 * cos_b2) / Math.max(0.02, Math.pow(cos_bm, 3)))
+    * dunhamCameRotor;
+  const customYsRotor = useCustomFormula && amConfig
     ? safeEvaluateMath(amConfig.customYsExpression, {
         secondaryCoeff, AR: aspectRatio, lambda: lambda_R, CL_sc: CL_over_sc,
         beta1: b1_rad, beta2: b2_rad, beta_m: Math.atan(tan_bm), b1: b1_rad, b2: b2_rad,
@@ -490,7 +539,7 @@ export function calculateAinleyMathiesonLosses(params: {
 
   // 3. Rotor Tip Clearance Loss Ytc
   const defaultYtcRotor = B_tip * tipClearanceRatio * Math.pow(CL_over_sc, 2) * ((cos_b2 * cos_b2) / Math.max(0.02, Math.pow(cos_bm, 3)));
-  const customYtcRotor = amConfig?.useCustomFormula
+  const customYtcRotor = useCustomFormula && amConfig
     ? safeEvaluateMath(amConfig.customYtcExpression, {
         B_tip, tipClearanceRatio, secondaryCoeff, AR: aspectRatio, CL_sc: CL_over_sc,
         beta1: b1_rad, beta2: b2_rad, beta_m: Math.atan(tan_bm), b1: b1_rad, b2: b2_rad,
@@ -500,7 +549,7 @@ export function calculateAinleyMathiesonLosses(params: {
   const Ytc_rotor = Math.max(0, Math.min(0.12, customYtcRotor));
 
   const Y_tot_rotor = Yp_rotor + Ys_rotor + Ytc_rotor;
-  const zeta_rotor = Y_tot_rotor / (1 + 0.5 * (gamma - 1) * (M_rel2 * M_rel2));
+  const zeta_rotor = ymToZeta(Y_tot_rotor, M_rel2, gamma);
   const dh_loss_rotor = zeta_rotor * 0.5 * (W2 * W2);
 
   // --- STATOR (NOZZLE) LOSSES ---
@@ -516,22 +565,34 @@ export function calculateAinleyMathiesonLosses(params: {
     const tan_am = 0.5 * (Math.tan(a0_rad) + Math.tan(a1_rad));
     const cos_am = 1 / Math.sqrt(1 + tan_am * tan_am);
     const cos_a1 = Math.cos(a1_rad);
+    const dunhamCameStator = Math.abs(cos_a1) / Math.max(0.05, Math.abs(Math.cos(a0_rad)));
 
     const CL_over_sc_N = 2 * Math.abs(Math.tan(a0_rad) - Math.tan(a1_rad)) * cos_am;
     const abs_a1 = Math.abs(alpha1_deg);
 
-    const defaultYpStator = nozzleA + nozzleB * Math.pow(abs_a1 / 100, 2.4) * Math.pow(s_over_c, -0.4);
-    Yp_stator = amConfig?.useCustomFormula
+    // Same nozzle–impulse interpolation as the rotor, with (α₀, α₁) in place of (β₁, β₂): an inlet swirl
+    // α₀ opposite to α₁ (repeating stage, upstream row) makes the vane partly impulse. With α₀ = 0, ξ = 0.
+    const Yp_nozzle_base_N = nozzleA + nozzleB * Math.pow(abs_a1 / 100, 2.4) * Math.pow(s_over_c, -0.4);
+    const Yp_impulse_base_N = impulseA + impulseB * Math.pow(abs_a1 / 100, 2.6) * Math.pow(s_over_c, -0.6);
+    const xi_signed_N = (-(Math.sign(alpha1_deg) || 1) * alpha0_deg) / Math.max(1.0, abs_a1);
+    const xi_N = Math.max(0, Math.min(1, xi_signed_N));
+    const Yp_base_N = Yp_nozzle_base_N + xi_N * xi_N * (Yp_impulse_base_N - Yp_nozzle_base_N);
+    const defaultYpStator = Yp_base_N * Math.pow(t_over_c / 0.20, xi_N);
+    Yp_stator = useCustomFormula && amConfig
       ? safeEvaluateMath(amConfig.customYpStatorExpression, {
-          nozzleA, nozzleB, abs_alpha1: abs_a1, alpha1: a1_rad,
+          Yp_base: Yp_base_N, Yp_nozzle: Yp_nozzle_base_N, Yp_impulse: Yp_impulse_base_N,
+          xi: xi_N, xi_signed: xi_signed_N, nozzleA, nozzleB, impulseA, impulseB,
+          abs_alpha1: abs_a1, alpha0: a0_rad, alpha1: a1_rad,
           s_over_c, t_over_c, AR: aspectRatio,
         }, defaultYpStator).value
       : defaultYpStator;
-    Yp_stator = Math.max(0.015, Math.min(0.20, Yp_stator));
+    Yp_stator = Math.max(0.015, Math.min(0.25, Yp_stator));
 
     const lambda_N = secondaryCoeff / aspectRatio;
-    const defaultYsStator = lambda_N * Math.pow(CL_over_sc_N, 2) * ((cos_a1 * cos_a1) / Math.max(0.02, Math.pow(cos_am, 3)));
-    Ys_stator = amConfig?.useCustomFormula
+    const defaultYsStator = lambda_N * Math.pow(CL_over_sc_N, 2)
+      * ((cos_a1 * cos_a1) / Math.max(0.02, Math.pow(cos_am, 3)))
+      * dunhamCameStator;
+    Ys_stator = useCustomFormula && amConfig
       ? safeEvaluateMath(amConfig.customYsExpression, {
           secondaryCoeff, AR: aspectRatio, lambda: lambda_N, CL_sc: CL_over_sc_N,
           alpha0: a0_rad, alpha1: a1_rad, alpha_m: Math.atan(tan_am),
@@ -539,10 +600,9 @@ export function calculateAinleyMathiesonLosses(params: {
         }, defaultYsStator).value
       : defaultYsStator;
     Ys_stator = Math.max(0, Math.min(0.20, Ys_stator));
-    Yp_stator = Math.max(0.015, Math.min(0.20, Yp_stator));
 
     Y_tot_stator = Yp_stator + Ys_stator;
-    zeta_stator = Y_tot_stator / (1 + 0.5 * (gamma - 1) * (M_abs1 * M_abs1));
+    zeta_stator = ymToZeta(Y_tot_stator, M_abs1, gamma);
     dh_loss_stator = zeta_stator * 0.5 * (V1 * V1);
   }
 
@@ -626,12 +686,16 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
   const nu = C0 > 0 ? U_mag / C0 : 0;
 
   // Axial velocity Va
-  const flowCoeffMult = inputs.customEquations?.kinematics?.flowCoeffMultiplier ?? 1.0;
+  const flowCoeffMult = finiteOr(inputs.customEquations?.kinematics?.flowCoeffMultiplier, 1.0);
   const phi = (inputs.phi && inputs.phi > 0 ? inputs.phi : 0.55) * flowCoeffMult;
   const Va = phi * U_mag;
   const activeLossModel: LossModel = lossModel;
-  const eulerSlip = inputs.customEquations?.kinematics?.eulerWorkMultiplier ?? 1.0;
+  const eulerSlip = finiteOr(inputs.customEquations?.kinematics?.eulerWorkMultiplier, 1.0);
   const isVaneless = inputs.rowConfiguration === 'counterrotating' || inputs.inletSwirlOverride !== undefined;
+
+  // Stator inlet (station 0/1): swirl inherited from an upstream row. Only meaningful with a stator.
+  const V_theta0 = isVaneless ? 0 : finiteOr(inputs.statorInletSwirl, 0);
+  const alpha0_deg = rad2deg(Math.atan2(V_theta0, Va));
   let dh_actual = 0.88 * dh_is;
   let psi = dh_actual / (U_mag * U_mag);
   let V_theta1 = 0;
@@ -685,7 +749,6 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
     V1_mag_init = Math.hypot(Va, V_theta1);
     V2_mag_init = Math.hypot(Va, V_theta2);
     T2_static = Math.max(200, T01 - V1_mag_init ** 2 / (2 * Cp));
-    P2_static = P01 * Math.pow(T2_static / T01, gamma / (gamma - 1));
     T03_actual = T01 - dh_actual / Cp;
     T3_static = Math.max(150, T03_actual - V2_mag_init ** 2 / (2 * Cp));
     P3_static = P03 * Math.pow(T3_static / T03_actual, gamma / (gamma - 1));
@@ -702,7 +765,7 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
     hubToTipRatio = hubRadius / tipRadius;
     chordEstimate = Math.max(0.005, inputs.axialChord && inputs.axialChord > 0
       ? inputs.axialChord
-      : bladeHeight / Math.max(0.2, inputs.customEquations?.sizing?.aspectRatioTarget ?? 1.6));
+      : bladeHeight / Math.max(0.2, finiteOr(inputs.customEquations?.sizing?.aspectRatioTarget, 1.6)));
 
     a2_pre = Math.sqrt(gamma * R_gas * T2_static);
     a3_pre = Math.sqrt(gamma * R_gas * T3_static);
@@ -715,7 +778,7 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
     beta2_deg_init = rad2deg(Math.atan2(W_theta2_init, Va));
 
     soderbergLoss = calculateSoderbergLosses({
-      eps_stator_deg: Math.abs(alpha1_deg_init),
+      eps_stator_deg: Math.abs(alpha1_deg_init - alpha0_deg),
       eps_rotor_deg: Math.abs(beta2_deg_init - beta1_deg_init),
       bladeHeight,
       chord: chordEstimate,
@@ -729,7 +792,7 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
     });
 
     ainleyMathiesonLoss = calculateAinleyMathiesonLosses({
-      alpha0_deg: 0,
+      alpha0_deg,
       alpha1_deg: alpha1_deg_init,
       beta1_deg: beta1_deg_init,
       beta2_deg: beta2_deg_init,
@@ -750,7 +813,7 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
     });
 
     const customLoss = inputs.customEquations?.userDefinedLoss;
-    if (activeLossModel === 'user_defined' && customLoss?.enabled) {
+    if (activeLossModel === 'user_defined' && customLoss?.enabled === true) {
       const variables = {
         dh_is,
         dh_actual,
@@ -807,6 +870,16 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
   }
   evaluateTrialState();
   const psi_is = dh_is / (U_mag * U_mag);
+
+  // Static pressure at the stator exit including the stator loss of the active model:
+  // h₂ − h₂s = Δh_loss,N, so T₂s = T₂ − Δh_loss,N/cp and P₂ = P₀₁(T₂s/T₀₁)^(γ/(γ−1)).
+  // T₂ is unchanged (h₀ is conserved through the stator). The user-defined model gives only a
+  // stage loss fraction, so it uses the Soderberg stator loss for this split.
+  const dh_loss_stator_active = activeLossModel === 'ainley_mathieson'
+    ? ainleyMathiesonLoss.dh_loss_stator
+    : soderbergLoss.dh_loss_stator;
+  const T2s_static = Math.max(1, T2_static - dh_loss_stator_active / Cp);
+  P2_static = P01 * Math.pow(T2s_static / T01, gamma / (gamma - 1));
 
   // Total-to-static efficiency must use the isentropic enthalpy drop to the
   // actual exit static pressure, rather than subtracting exit kinetic energy
@@ -889,8 +962,12 @@ export function calculateTurbineStage1D(inputs: TurbineInputs): TurbineOutputs {
   const power_MW = power_kW / 1000;
   const torque_Nm = (dir * power_W) / omega;
 
-  const T1_static = T01 - (Va * Va) / (2 * Cp);
-  const P1_static = P01 * Math.pow(Math.max(0.1, T1_static / T01), gamma / (gamma - 1));
+  // Station 1 is the row inlet. Without a stator it is the rotor inlet plane itself, so it carries
+  // the inherited swirl V_θ1 and its static state is that of station 2 (no loss in between).
+  const T1_static = isVaneless ? T2_static : T01 - (Va * Va + V_theta0 * V_theta0) / (2 * Cp);
+  const P1_static = isVaneless
+    ? P2_static
+    : P01 * Math.pow(Math.max(0.1, T1_static / T01), gamma / (gamma - 1));
 
   // Balje Ns-Ds
   const Ns = (omega * Math.sqrt(volume_flow_exit)) / Math.pow(Math.max(1, dh_is), 0.75);
@@ -990,6 +1067,7 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
   let currentP0 = P01;
   let currentT0 = T01;
   let lastExitSwirl: number | undefined = undefined;
+  let lastExitRm: number | undefined = undefined;
 
   let dh_actual_overall = 0;
   let sum_dh_is_stages = 0;
@@ -1009,6 +1087,23 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
       vanelessCount++;
     }
 
+    // A stator downstream of another row sees that row's exit swirl. Through the inter-row gap the
+    // angular momentum r·V_θ is conserved, so V_θ0 = V_θ,exit · Rm_prev / Rm.
+    const statorInletSwirl = i > 0
+      && !useVaneless
+      && (stage.rowConfiguration ?? 'normal') === 'normal'
+      && lastExitSwirl !== undefined
+      && lastExitRm !== undefined
+      && stage.Rm > 0
+      ? lastExitSwirl * (lastExitRm / stage.Rm)
+      : undefined;
+    // A rotor fed directly by the previous row (vaneless gap) sees the same r·V_θ conservation.
+    const vanelessInletSwirl = useVaneless && lastExitSwirl !== undefined
+      ? (lastExitRm !== undefined && lastExitRm > 0 && stage.Rm > 0
+          ? lastExitSwirl * (lastExitRm / stage.Rm)
+          : lastExitSwirl)
+      : undefined;
+
     const makeStageInputs = (PR: number): TurbineInputs => ({
       m_dot,
       P01: currentP0,
@@ -1021,7 +1116,8 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
       rowConfiguration: stage.rowConfiguration ?? 'normal',
       phi: stage.phi,
       direction: stage.direction,
-      inletSwirlOverride: useVaneless && lastExitSwirl !== undefined ? lastExitSwirl : undefined,
+      inletSwirlOverride: vanelessInletSwirl,
+      statorInletSwirl,
       gasKey: inputs.gasKey,
       customGamma: inputs.customGamma,
       customCp: inputs.customCp,
@@ -1059,7 +1155,9 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
     dh_actual_overall += res.dh_actual;
     sum_dh_is_stages += res.dh_is;
     net_torque_Nm += res.torque_Nm;
-    const shaftName = stage.shaftName || `Eje ${stage.N.toLocaleString()} rpm`;
+    // A given shaftName is kept as is (the UI normalises it); the rpm label is only a fallback
+    // for external callers that do not name their shafts.
+    const shaftName = stage.shaftName ?? `Eje ${stage.N.toLocaleString('es-ES')} rpm`;
     const shaftKey = `${shaftName}:${stage.N}:${stage.direction}`;
     const shaftTotal = shaftTotals.get(shaftKey) || { shaftName, N: stage.N, direction: stage.direction, power_W: 0, torque_Nm: 0, targetPowerMW: undefined as number | undefined };
     shaftTotal.power_W += res.power_kW * 1000;
@@ -1070,6 +1168,7 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
     currentP0 = res.P03;
     currentT0 = res.T03_actual;
     lastExitSwirl = res.outletTriangle.V_theta;
+    lastExitRm = stage.Rm;
   }
 
   const PR_overall = stageResults.reduce((acc, result) => acc * result.inputs.PR, 1.0);
@@ -1078,6 +1177,14 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
 
   const reheatFactor = dh_is_overall > 0 ? sum_dh_is_stages / dh_is_overall : 1.0;
   const eta_overall_tt = dh_is_overall > 0 ? dh_actual_overall / dh_is_overall : 0;
+
+  const lastStageResult = stageResults[stageResults.length - 1];
+  const dh_is_to_exit_static_overall = lastStageResult
+    ? gas.Cp * T01 * (1 - Math.pow(lastStageResult.P3_static / P01, expP))
+    : 0;
+  const eta_overall_ts = dh_is_to_exit_static_overall > 0
+    ? Math.max(0, Math.min(1, dh_actual_overall / dh_is_to_exit_static_overall))
+    : 0;
 
   const power_total_W = m_dot * dh_actual_overall;
   const power_total_kW = power_total_W / 1000;
@@ -1092,6 +1199,7 @@ export function calculateMultiStageTurbine(inputs: MultiStageInputs): MultiStage
     dh_actual_overall,
     reheatFactor,
     eta_overall_tt,
+    eta_overall_ts,
     power_total_kW,
     power_total_MW,
     net_torque_Nm,

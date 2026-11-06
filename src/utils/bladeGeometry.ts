@@ -27,8 +27,27 @@ export interface BladeSectionParams {
   pitch_s: number;         // Zweifel pitch spacing [mm]
 }
 
+/** Inclusive index range of one surface segment inside `curves.fullContour`. */
+export interface ContourSegmentRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * Where each surface lies inside `curves.fullContour`:
+ * leading-edge arc, suction side (extradós), trailing-edge arc and pressure side (intradós).
+ * The ranges are contiguous, do not overlap and cover the whole contour.
+ */
+export interface ContourSegmentRanges {
+  le: ContourSegmentRange;
+  ss: ContourSegmentRange;
+  te: ContourSegmentRange;
+  ps: ContourSegmentRange;
+}
+
 export interface BladeProfileResult {
   params: BladeSectionParams;
+  segmentRanges: ContourSegmentRanges;
   controlPoints: {
     suctionSide: [Point2D, Point2D, Point2D, Point2D];
     pressureSide: [Point2D, Point2D, Point2D, Point2D];
@@ -65,7 +84,22 @@ export interface RadialBladeDesign {
   R_hub_mm: number;
   R_tip_mm: number;
   psi_Zweifel: number;
+  /**
+   * Zweifel loading of the mid section at the actual pitch (integer Z), evaluated exactly as the
+   * cascade was sized: flow angles, the configured multiplier and the custom formula when active.
+   */
+  zweifelLoading: number;
+  /**
+   * True when the vortex exponent n differs from 1 (free vortex). Hub and tip angles are then
+   * computed with Vθ·r^n = const but a radially constant Va, which does not satisfy simple radial
+   * equilibrium: the UI should warn that those sections are only indicative.
+   */
+  vortexExponentWarning: boolean;
 }
+
+/** Message the UI can show when `RadialBladeDesign.vortexExponentWarning` is true. */
+export const VORTEX_EXPONENT_WARNING_MESSAGE =
+  'Con un exponente de vórtice distinto de 1 se mantiene Va constante en todo el radio, lo que no cumple el equilibrio radial: los ángulos de buje y punta son solo orientativos.';
 
 export interface CascadeSizing {
   bladeCount_Z: number;
@@ -77,6 +111,33 @@ export interface CascadeSizing {
   R_tip_mm: number;
   psi_Zweifel: number;
   zweifelLoading: number;
+}
+
+/**
+ * Zweifel loading ψ_Z at a given pitch, with flow angles in radians. The classic form is
+ * ψ_Z = k·(s/c_ax)·cos²β2·|tanβ1 − tanβ2| (k = 2); a custom expression, when given, replaces it and
+ * falls back to the classic value if it cannot be evaluated.
+ */
+export function zweifelLoadingAt(options: {
+  pitch_mm: number;
+  c_ax_mm: number;
+  beta1_rad: number;
+  beta2_rad: number;
+  multiplier?: number;
+  psi_Zweifel?: number;
+  customExpression?: string;
+}): number {
+  const { pitch_mm, c_ax_mm, beta1_rad, beta2_rad, psi_Zweifel = 0.85, customExpression } = options;
+  const multiplier = Math.max(0.1, Math.min(10, options.multiplier ?? 2));
+  const cAx = Math.max(1, c_ax_mm);
+  const cos2Beta2 = Math.max(0.08, Math.cos(beta2_rad) ** 2);
+  const classic = multiplier * (pitch_mm / cAx) * cos2Beta2 * Math.abs(Math.tan(beta1_rad) - Math.tan(beta2_rad));
+  if (typeof customExpression !== 'string' || !customExpression.trim()) return classic;
+  const value = safeEvaluateMath(customExpression, {
+    s: pitch_mm, c_ax: cAx, b1_rad: beta1_rad, b2_rad: beta2_rad,
+    b1: beta1_rad, b2: beta2_rad, psi_Z: psi_Zweifel,
+  }, classic).value;
+  return Number.isFinite(value) ? value : classic;
 }
 
 /** Sizes a rotor cascade without generating any aerodynamic profile contours. */
@@ -108,7 +169,7 @@ export function calculateCascadeSizing(options: {
     ? psi_Zweifel * cAx / (multiplier * cos2Beta2 * tanDiff)
     : cAx * 1e6;
 
-  if (useCustomZweifelFormula && customZweifelExpression.trim()) {
+  if (useCustomZweifelFormula && typeof customZweifelExpression === 'string' && customZweifelExpression.trim()) {
     const evaluateAtPitch = (pitch: number) => safeEvaluateMath(customZweifelExpression, {
       s: pitch, c_ax: cAx, b1_rad: beta1, b2_rad: beta2,
       b1: beta1, b2: beta2, psi_Z: psi_Zweifel,
@@ -135,7 +196,12 @@ export function calculateCascadeSizing(options: {
   const bladeCount_Z = Math.max(12, Math.min(180, Math.round(rawCount)));
   const pitch_mid_mm = 2 * Math.PI * Rm_mm / bladeCount_Z;
   const solidity_mid = cAx / pitch_mid_mm;
-  const zweifelLoading = multiplier * solidity_mid * cos2Beta2 * tanDiff;
+  // Zweifel loading with the pitch that results from rounding Z to an integer, using the same
+  // multiplier and formula (classic or custom) that sized the pitch.
+  const zweifelLoading = zweifelLoadingAt({
+    pitch_mm: pitch_mid_mm, c_ax_mm: cAx, beta1_rad: beta1, beta2_rad: beta2, multiplier, psi_Zweifel,
+    customExpression: useCustomZweifelFormula ? customZweifelExpression : undefined,
+  });
   const hb_mm = hb_m * 1000;
   return {
     bladeCount_Z,
@@ -381,22 +447,33 @@ export function generateBladeProfile(params: BladeSectionParams): BladeProfileRe
     ...pressurePoints.slice(0, -1).reverse(),
   ];
 
+  const leEnd = leArcPoints.length - 1;
+  const ssEnd = leEnd + suctionPoints.length - 1;
+  const teEnd = ssEnd + teArcPoints.length - 1;
+  const segmentRanges: ContourSegmentRanges = {
+    le: { start: 0, end: leEnd },
+    ss: { start: leEnd + 1, end: ssEnd },
+    te: { start: ssEnd + 1, end: teEnd },
+    ps: { start: teEnd + 1, end: fullContour.length - 1 },
+  };
+
   // Estimate throat opening (o) from adjacent blade passage: o ~ pitch * cos(beta_metal_2)
   const throatEstimate = pitch_s > 0 ? pitch_s * Math.cos(beta2_rad) : c_ax * 0.45;
   const pitch_to_chord = pitch_s > 0 ? pitch_s / trueChord : 0.8;
 
-  // Zweifel loading coefficient estimation:
-  // psi_Z = 2 * (s / c_ax) * cos^2(beta2) * |tan(beta1) - tan(beta2)|
-  const zweifelLoading =
-    pitch_s > 0
-      ? 2 *
-        (pitch_s / c_ax) *
-        Math.pow(Math.cos(beta2_rad), 2) *
-        Math.abs(Math.tan(beta1_rad) - Math.tan(beta2_rad))
-      : 0.85;
+  // Classic Zweifel indicator of this section (k = 2) from the flow angles, not the metal angles:
+  // the loading is a property of the flow turning. The radial design reports the loading with the
+  // configured multiplier and formula in RadialBladeDesign.zweifelLoading.
+  const zweifelLoading = pitch_s > 0
+    ? zweifelLoadingAt({
+        pitch_mm: pitch_s, c_ax_mm: c_ax,
+        beta1_rad: params.beta_flow_1 * DEG2RAD, beta2_rad: params.beta_flow_2 * DEG2RAD,
+      })
+    : 0.85;
 
   return {
     params,
+    segmentRanges,
     controlPoints: {
       suctionSide: [p0_ss, p1_ss, p2_ss, p3_ss],
       pressureSide: [p0_ps, p1_ps, p2_ps, p3_ps],
@@ -501,7 +578,7 @@ export function calculateRadialEquilibriumBladeSections(options: {
     ? (psi_Zweifel * c_ax_mid) / denominator_mid
     : c_ax_mid * 1e6;
 
-  if (useCustomZweifelFormula && customZweifelExpression.trim()) {
+  if (useCustomZweifelFormula && typeof customZweifelExpression === 'string' && customZweifelExpression.trim()) {
     const evaluateZweifelAtPitch = (pitch_mm: number) => safeEvaluateMath(customZweifelExpression, {
       s: pitch_mm,
       c_ax: c_ax_mid,
@@ -546,6 +623,11 @@ export function calculateRadialEquilibriumBladeSections(options: {
   const t_max_hub = t_max_mid * 1.25;
   const t_max_tip = t_max_mid * 0.75;
 
+  // Incidence and deviation are defined relative to the turning direction of the rotor, which
+  // follows the sign of U: with U > 0 the relative flow turns towards negative angles. Mirroring
+  // the triangles (U, Vθ1, Vθ2) → (−U, −Vθ1, −Vθ2) therefore mirrors the metal angles too.
+  const turnSign = -(Math.sign(U_mid_ms) || 1);
+
   // Helper to compute section parameters under free vortex
   const computeSection = (
     name: 'Hub' | 'Mid' | 'Tip',
@@ -570,8 +652,8 @@ export function calculateRadialEquilibriumBladeSections(options: {
     const beta_flow_2 = Math.atan2(W_theta2_r, Va_mid_ms) * RAD2DEG;
 
     // Metal angles with incidence & deviation
-    const beta_metal_1 = beta_flow_1 + incidence_deg;
-    const beta_metal_2 = beta_flow_2 - deviation_deg;
+    const beta_metal_1 = beta_flow_1 - turnSign * incidence_deg;
+    const beta_metal_2 = beta_flow_2 + turnSign * deviation_deg;
 
     // Stagger angle gamma: weighted mean between metal angles
     const stagger_deg = beta_metal_1 * 0.45 + beta_metal_2 * 0.55;
@@ -618,5 +700,11 @@ export function calculateRadialEquilibriumBladeSections(options: {
     R_hub_mm,
     R_tip_mm,
     psi_Zweifel,
+    zweifelLoading: zweifelLoadingAt({
+      pitch_mm: pitch_mid_mm, c_ax_mm: c_ax_mid, beta1_rad: beta1_mid_rad, beta2_rad: beta2_mid_rad,
+      multiplier, psi_Zweifel,
+      customExpression: useCustomZweifelFormula ? customZweifelExpression : undefined,
+    }),
+    vortexExponentWarning: Math.abs(nVortex - 1) > 1e-9,
   };
 }

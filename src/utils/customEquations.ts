@@ -23,19 +23,27 @@ export interface CustomEquationsConfig {
   };
 
   // --- 1. SODERBERG (1949) MODEL CUSTOMIZATION ---
+  // Forma única usada por el solver, por defecto y personalizada:
+  //   ζ₀ = a + b·(ε/100)^c − tk·(t/c)/0.20
+  //   ζ  = (1 + ζ₀)·F_AR − 1,  F_AR = dStator + eStator/AR (estator) o d + e/AR (rotor)
   soderberg: {
     enabled: boolean;
     useCustomFormula: boolean;
-    // Parameterized form: zeta0 = a + b * (eps / 100)^c
-    a: number;          // Default 0.04
-    b: number;          // Default 0.06
-    c: number;          // Default 2.0
-    // Aspect ratio correction: (1 + zeta0) * (d + e / AR) - 1
-    d: number;          // Default 0.975
-    e: number;          // Default 0.075
-    // Arbitrary JS expression if useCustomFormula is true: (eps, AR) => number
-    customExpression: string; // e.g. "0.04 + 0.06 * Math.pow(eps / 100, 2)"
-    customArExpression: string; // e.g. "0.975 + 0.075 / AR"
+    a: number;          // 0.04
+    b: number;          // 0.06
+    c: number;          // 2.0
+    /** Corrección por relación de aspecto del rotor. */
+    d: number;          // 0.975
+    e: number;          // 0.075
+    /** Corrección por relación de aspecto del estator. */
+    dStator: number;    // 0.993
+    eStator: number;    // 0.021
+    /** Coeficiente del término de espesor; 0 reproduce la correlación publicada con t/c = 0.20. */
+    tk: number;         // 0
+    /** Expresión de ζ₀ si useCustomFormula. Variables: eps [°], AR, row (0 estator, 1 rotor), tc (t/c). */
+    customExpression: string;
+    /** Expresión de F_AR si useCustomFormula. Mismas variables que customExpression. */
+    customArExpression: string;
   };
 
   // --- 2. AINLEY & MATHIESON (1951) MODEL CUSTOMIZATION ---
@@ -130,8 +138,11 @@ export const SAFE_DEFAULT_EQUATIONS: CustomEquationsConfig = {
     c: 2.0,
     d: 0.975,
     e: 0.075,
+    dStator: 0.993,
+    eStator: 0.021,
+    tk: 0,
     customExpression: '0.04 + 0.06 * Math.pow(eps / 100, 2)',
-    customArExpression: '0.975 + 0.075 / AR',
+    customArExpression: '(1 - row) * (0.993 + 0.021 / AR) + row * (0.975 + 0.075 / AR)',
   },
 
   ainleyMathieson: {
@@ -144,8 +155,8 @@ export const SAFE_DEFAULT_EQUATIONS: CustomEquationsConfig = {
     secondaryCoeff: 0.033,
     tipClearanceCoeff: 0.50,
     customYpExpression: 'Yp_base * Math.pow(t_over_c / 0.20, xi)',
-    customYsExpression: '(secondaryCoeff / AR) * Math.pow(CL_sc, 2) * (Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3))',
-    customYpStatorExpression: 'nozzleA + nozzleB * Math.pow(abs_alpha1 / 100, 2.4) * Math.pow(s_over_c, -0.4)',
+    customYsExpression: '(secondaryCoeff / AR) * Math.pow(CL_sc, 2) * (Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3)) * (Math.cos(b2) / Math.cos(b1))',
+    customYpStatorExpression: 'Yp_base * Math.pow(t_over_c / 0.20, xi)',
     customYtcExpression: 'B_tip * tipClearanceRatio * Math.pow(CL_sc, 2) * (Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3))',
   },
 
@@ -183,31 +194,143 @@ export const SAFE_DEFAULT_EQUATIONS: CustomEquationsConfig = {
   },
 };
 
-/** Mergea configuraciones antiguas/importadas con las ecuaciones disponibles actualmente. */
-export function normalizeCustomEquations(value: unknown): CustomEquationsConfig {
-  const parsed = value && typeof value === 'object' ? value as Partial<CustomEquationsConfig> : {};
-  const base = SAFE_DEFAULT_EQUATIONS;
-  const userEquations = Array.isArray(parsed.userEquations)
-    ? parsed.userEquations.filter((equation) => equation
-      && typeof equation.id === 'string'
-      && typeof equation.name === 'string'
-      && typeof equation.expression === 'string'
-      && typeof equation.description === 'string')
-    : [];
+/** Longitud máxima admitida para cualquier texto de la configuración (nombres y expresiones). */
+const MAX_CONFIG_STRING_LENGTH = 2000;
+/** Número máximo de ecuaciones de usuario que se conservan al normalizar. */
+const MAX_USER_EQUATIONS = 200;
 
-  return {
-    ...base,
-    ...parsed,
-    userEquations,
-    userDefinedLoss: { ...base.userDefinedLoss, ...parsed.userDefinedLoss },
-    soderberg: { ...base.soderberg, ...parsed.soderberg },
-    ainleyMathieson: { ...base.ainleyMathieson, ...parsed.ainleyMathieson },
-    sizing: { ...base.sizing, ...parsed.sizing },
-    zweifel: { ...base.zweifel, ...parsed.zweifel },
-    thermodynamics: { ...base.thermodynamics, ...parsed.thermodynamics },
-    kinematics: { ...base.kinematics, ...parsed.kinematics },
-    geometry: { ...base.geometry, ...parsed.geometry },
+/**
+ * Expresiones por defecto de versiones anteriores que contenían errores de física.
+ * Si una configuración guardada conserva exactamente el texto antiguo, se sustituye por el actual.
+ */
+const LEGACY_DEFAULT_EXPRESSIONS = {
+  /** Sin el factor cos β₂/cos β₁ de Dunham-Came. */
+  customYsExpression: '(secondaryCoeff / AR) * Math.pow(CL_sc, 2) * (Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3))',
+  /** Aplicaba las constantes del rotor también al estator. */
+  customArExpression: '0.975 + 0.075 / AR',
+} as const;
+
+type ConfigPrimitive = number | string | boolean;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Convierte un número finito o un texto numérico no vacío; cualquier otra cosa devuelve undefined. */
+function parseFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '') return undefined;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+/** Valida un valor contra el tipo del valor por defecto. Devuelve undefined si no es válido. */
+function coerceLike(defaultValue: ConfigPrimitive, value: unknown): ConfigPrimitive | undefined {
+  if (typeof defaultValue === 'number') return parseFiniteNumber(value);
+  if (typeof defaultValue === 'boolean') return typeof value === 'boolean' ? value : undefined;
+  return typeof value === 'string' && value.length <= MAX_CONFIG_STRING_LENGTH ? value : undefined;
+}
+
+/**
+ * Copia de `defaults` en la que cada clave conocida presente en `raw` se sustituye por su valor
+ * validado. Las claves desconocidas se descartan y cada valor inválido suma uno a `counter`.
+ */
+function sanitizeSection<T extends { [K in keyof T]: ConfigPrimitive }>(
+  defaults: T,
+  raw: unknown,
+  counter: { resets: number },
+): T {
+  const result: T = { ...defaults };
+  if (raw === undefined) return result;
+  if (!isPlainObject(raw)) {
+    counter.resets++;
+    return result;
+  }
+  for (const key of Object.keys(defaults) as (keyof T & string)[]) {
+    if (!Object.hasOwn(raw, key)) continue;
+    const parsed = coerceLike(defaults[key], raw[key]);
+    if (parsed === undefined) counter.resets++;
+    else result[key] = parsed as T[typeof key];
+  }
+  return result;
+}
+
+function sanitizeUserEquations(raw: unknown, counter: { resets: number }): CustomEquationsConfig['userEquations'] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    counter.resets++;
+    return [];
+  }
+  const isText = (value: unknown): value is string => typeof value === 'string' && value.length <= MAX_CONFIG_STRING_LENGTH;
+  const equations: CustomEquationsConfig['userEquations'] = [];
+  for (const entry of raw) {
+    if (!isPlainObject(entry)) {
+      counter.resets++;
+      continue;
+    }
+    const description = entry.description === undefined ? '' : entry.description;
+    if (
+      isText(entry.id) && isText(entry.name) && isText(entry.expression) && isText(description)
+      && equations.length < MAX_USER_EQUATIONS
+    ) {
+      equations.push({ id: entry.id, name: entry.name, expression: entry.expression, description });
+    } else {
+      counter.resets++;
+    }
+  }
+  return equations;
+}
+
+/**
+ * Normaliza una configuración guardada o importada campo a campo contra SAFE_DEFAULT_EQUATIONS.
+ * Cada campo conocido conserva su valor solo si tiene el tipo del valor por defecto (los números
+ * admiten texto numérico no vacío); si no, se restablece y se cuenta en `resetCount`. Las claves
+ * desconocidas se descartan y los campos ausentes toman el valor por defecto sin contarse.
+ */
+export function normalizeCustomEquationsReport(value: unknown): { config: CustomEquationsConfig; resetCount: number } {
+  const base = SAFE_DEFAULT_EQUATIONS;
+  const counter = { resets: 0 };
+  const parsed: Record<string, unknown> = isPlainObject(value) ? value : {};
+  if (value !== undefined && value !== null && !isPlainObject(value)) counter.resets++;
+
+  const name = parsed.name === undefined ? base.name : coerceLike(base.name, parsed.name);
+  if (name === undefined) counter.resets++;
+  const isModified = parsed.isModified === undefined ? base.isModified : coerceLike(base.isModified, parsed.isModified);
+  if (isModified === undefined) counter.resets++;
+
+  const config: CustomEquationsConfig = {
+    // La configuración normalizada siempre queda en el esquema actual.
+    version: base.version,
+    name: typeof name === 'string' ? name : base.name,
+    isModified: typeof isModified === 'boolean' ? isModified : base.isModified,
+    userEquations: sanitizeUserEquations(parsed.userEquations, counter),
+    userDefinedLoss: sanitizeSection(base.userDefinedLoss, parsed.userDefinedLoss, counter),
+    soderberg: sanitizeSection(base.soderberg, parsed.soderberg, counter),
+    ainleyMathieson: sanitizeSection(base.ainleyMathieson, parsed.ainleyMathieson, counter),
+    sizing: sanitizeSection(base.sizing, parsed.sizing, counter),
+    zweifel: sanitizeSection(base.zweifel, parsed.zweifel, counter),
+    thermodynamics: sanitizeSection(base.thermodynamics, parsed.thermodynamics, counter),
+    kinematics: sanitizeSection(base.kinematics, parsed.kinematics, counter),
+    geometry: sanitizeSection(base.geometry, parsed.geometry, counter),
   };
+
+  if (config.ainleyMathieson.customYsExpression === LEGACY_DEFAULT_EXPRESSIONS.customYsExpression) {
+    config.ainleyMathieson.customYsExpression = base.ainleyMathieson.customYsExpression;
+  }
+  if (config.soderberg.customArExpression === LEGACY_DEFAULT_EXPRESSIONS.customArExpression) {
+    config.soderberg.customArExpression = base.soderberg.customArExpression;
+  }
+
+  return { config, resetCount: counter.resets };
+}
+
+/** Normaliza una configuración guardada o importada (véase normalizeCustomEquationsReport). */
+export function normalizeCustomEquations(value: unknown): CustomEquationsConfig {
+  return normalizeCustomEquationsReport(value).config;
 }
 
 export interface EquationTemplate {
@@ -243,15 +366,14 @@ export const EQUATION_TEMPLATES: EquationTemplate[] = [
   },
   {
     id: 'dunham_came_modified',
-    label: 'Ainley-Mathieson Dunham-Came (1970)',
-    description: 'Ajuste empírico de Dunham & Came con coeficiente secundario incrementado para álabes de baja relación de aspecto.',
+    label: 'Ainley-Mathieson con coeficientes de Dunham-Came (1970)',
+    description: 'Coeficiente secundario publicado por Dunham & Came (0.0334). El factor cos α₂/cos α₁ de su corrección ya forma parte del modelo base.',
     badge: 'Aeronáutico',
     config: {
       name: 'Dunham-Came (1970)',
       ainleyMathieson: {
         ...SAFE_DEFAULT_EQUATIONS.ainleyMathieson,
-        secondaryCoeff: 0.038,
-        tipClearanceCoeff: 0.55,
+        secondaryCoeff: 0.0334,
       },
     },
   },
@@ -301,118 +423,259 @@ export const EQUATION_TEMPLATES: EquationTemplate[] = [
   },
 ];
 
-/** Evalúa expresiones aritméticas con un parser y funciones Math permitidas (sin ejecutar JavaScript arbitrario). */
+/** Error de una expresión del usuario; su mensaje ya está en español y se muestra tal cual. */
+class ExpressionError extends Error {}
+
+type CompiledNode = (scope: Readonly<Record<string, number>>) => number;
+
+/** Resultado de compilar una expresión: una función evaluable o el motivo del rechazo. */
+export type CompiledExpression =
+  | { ok: true; evaluate: CompiledNode }
+  | { ok: false; error: string };
+
+interface AllowedFunction {
+  fn: (...args: number[]) => number;
+  minArgs: number;
+  maxArgs: number;
+}
+
+const unaryFunction = (fn: (x: number) => number): AllowedFunction => ({ fn, minArgs: 1, maxArgs: 1 });
+const binaryFunction = (fn: (x: number, y: number) => number): AllowedFunction => ({ fn, minArgs: 2, maxArgs: 2 });
+const variadicFunction = (fn: (...values: number[]) => number): AllowedFunction => ({ fn, minArgs: 1, maxArgs: 64 });
+
+/** Funciones admitidas. Un Map evita que nombres heredados de Object.prototype pasen como funciones. */
+const ALLOWED_FUNCTIONS: ReadonlyMap<string, AllowedFunction> = new Map([
+  ['Math.abs', unaryFunction(Math.abs)],
+  ['Math.sqrt', unaryFunction(Math.sqrt)],
+  ['Math.pow', binaryFunction(Math.pow)],
+  ['Math.min', variadicFunction(Math.min)],
+  ['Math.max', variadicFunction(Math.max)],
+  ['Math.sin', unaryFunction(Math.sin)],
+  ['Math.cos', unaryFunction(Math.cos)],
+  ['Math.tan', unaryFunction(Math.tan)],
+  ['Math.asin', unaryFunction(Math.asin)],
+  ['Math.acos', unaryFunction(Math.acos)],
+  ['Math.atan', unaryFunction(Math.atan)],
+  ['Math.atan2', binaryFunction(Math.atan2)],
+  ['Math.exp', unaryFunction(Math.exp)],
+  ['Math.log', unaryFunction(Math.log)],
+  ['Math.log10', unaryFunction(Math.log10)],
+  ['Math.floor', unaryFunction(Math.floor)],
+  ['Math.ceil', unaryFunction(Math.ceil)],
+  ['Math.round', unaryFunction(Math.round)],
+  ['Math.sign', unaryFunction(Math.sign)],
+  ['Math.hypot', variadicFunction(Math.hypot)],
+]);
+
+const ALLOWED_CONSTANTS: ReadonlyMap<string, number> = new Map([
+  ['Math.PI', Math.PI],
+  ['Math.E', Math.E],
+  ['pi', Math.PI],
+]);
+
+const MAX_EXPRESSION_LENGTH = 1024;
+const MAX_EXPRESSION_TOKENS = 512;
+const MAX_EXPRESSION_DEPTH = 100;
+const COMPILED_CACHE_LIMIT = 256;
+const compiledCache = new Map<string, CompiledExpression>();
+
+function describeArity({ minArgs, maxArgs }: AllowedFunction): string {
+  if (minArgs === maxArgs) return minArgs === 1 ? '1 argumento' : `${minArgs} argumentos`;
+  return `entre ${minArgs} y ${maxArgs} argumentos`;
+}
+
+function callNode(spec: AllowedFunction, args: CompiledNode[]): CompiledNode {
+  const { fn } = spec;
+  if (args.length === 1) {
+    const [first] = args;
+    return (scope) => fn(first(scope));
+  }
+  if (args.length === 2) {
+    const [first, second] = args;
+    return (scope) => fn(first(scope), second(scope));
+  }
+  return (scope) => fn(...args.map((arg) => arg(scope)));
+}
+
+function variableNode(name: string): CompiledNode {
+  const constant = ALLOWED_CONSTANTS.get(name);
+  return (scope) => {
+    if (Object.hasOwn(scope, name)) {
+      const value = scope[name];
+      return typeof value === 'number' ? value : Number.NaN;
+    }
+    if (constant !== undefined) return constant;
+    throw new ExpressionError(`Variable no disponible: ${name}.`);
+  };
+}
+
+/** Analiza la expresión una sola vez y la convierte en un árbol de closures. Lanza ExpressionError. */
+function parseExpression(expr: string): CompiledNode {
+  if (expr.length > MAX_EXPRESSION_LENGTH) {
+    throw new ExpressionError(`La expresión supera ${MAX_EXPRESSION_LENGTH} caracteres.`);
+  }
+
+  type Token = { kind: 'number' | 'identifier' | 'operator' | 'eof'; value: string };
+  const tokens: Token[] = [];
+  let cursor = 0;
+  while (cursor < expr.length) {
+    const rest = expr.slice(cursor);
+    const whitespace = rest.match(/^\s+/);
+    if (whitespace) { cursor += whitespace[0].length; continue; }
+    const number = rest.match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/);
+    if (number) { tokens.push({ kind: 'number', value: number[0] }); cursor += number[0].length; continue; }
+    const identifier = rest.match(/^[A-Za-z_][A-Za-z0-9_.]*/);
+    if (identifier) { tokens.push({ kind: 'identifier', value: identifier[0] }); cursor += identifier[0].length; continue; }
+    const operator = rest.match(/^(\*\*|[+\-*/%^(),])/);
+    if (operator) { tokens.push({ kind: 'operator', value: operator[0] }); cursor += operator[0].length; continue; }
+    throw new ExpressionError(`Carácter no permitido en la posición ${cursor + 1}.`);
+  }
+  if (tokens.length > MAX_EXPRESSION_TOKENS) throw new ExpressionError('La expresión contiene demasiados elementos.');
+  tokens.push({ kind: 'eof', value: '' });
+
+  let index = 0;
+  let depth = 0;
+  const peek = () => tokens[index];
+  const take = () => tokens[index++];
+  const accept = (value: string) => {
+    if (peek().kind === 'operator' && peek().value === value) {
+      index++;
+      return true;
+    }
+    return false;
+  };
+  const expect = (value: string) => {
+    if (!accept(value)) throw new ExpressionError(`Se esperaba «${value}».`);
+  };
+
+  const primary = (): CompiledNode => {
+    if (++depth > MAX_EXPRESSION_DEPTH) throw new ExpressionError('La expresión está anidada en exceso.');
+    let node: CompiledNode;
+    const token = peek();
+    if (token.kind === 'number') {
+      const value = Number(take().value);
+      node = () => value;
+    } else if (accept('(')) {
+      node = addSub();
+      expect(')');
+    } else if (token.kind === 'identifier') {
+      const name = take().value;
+      if (accept('(')) {
+        const spec = ALLOWED_FUNCTIONS.get(name);
+        if (!spec) throw new ExpressionError(`Función no permitida: ${name}. Usa las funciones Math admitidas.`);
+        const args: CompiledNode[] = [];
+        if (!accept(')')) {
+          do { args.push(addSub()); } while (accept(','));
+          expect(')');
+        }
+        if (args.length < spec.minArgs || args.length > spec.maxArgs) {
+          throw new ExpressionError(`${name} espera ${describeArity(spec)} y recibe ${args.length}.`);
+        }
+        node = callNode(spec, args);
+      } else {
+        node = variableNode(name);
+      }
+    } else {
+      throw new ExpressionError('Se esperaba un número, una variable o un paréntesis.');
+    }
+    depth--;
+    return node;
+  };
+
+  const power = (): CompiledNode => {
+    const base = primary();
+    if (accept('^') || accept('**')) {
+      const exponent = unary();
+      return (scope) => Math.pow(base(scope), exponent(scope));
+    }
+    return base;
+  };
+  const unary = (): CompiledNode => {
+    if (accept('+')) return unary();
+    if (accept('-')) {
+      const operand = unary();
+      return (scope) => -operand(scope);
+    }
+    return power();
+  };
+  const mulDiv = (): CompiledNode => {
+    let node = unary();
+    while (peek().value === '*' || peek().value === '/' || peek().value === '%') {
+      const op = take().value;
+      const left = node;
+      const right = unary();
+      node = op === '*'
+        ? (scope) => left(scope) * right(scope)
+        : op === '/'
+        ? (scope) => left(scope) / right(scope)
+        : (scope) => left(scope) % right(scope);
+    }
+    return node;
+  };
+  const addSub = (): CompiledNode => {
+    let node = mulDiv();
+    while (peek().value === '+' || peek().value === '-') {
+      const op = take().value;
+      const left = node;
+      const right = mulDiv();
+      node = op === '+' ? (scope) => left(scope) + right(scope) : (scope) => left(scope) - right(scope);
+    }
+    return node;
+  };
+
+  const root = addSub();
+  if (peek().kind !== 'eof') throw new ExpressionError(`Elemento inesperado: ${peek().value}.`);
+  return root;
+}
+
+/**
+ * Compila una expresión aritmética (sin eval) y la guarda en una caché de como máximo
+ * COMPILED_CACHE_LIMIT entradas, de modo que cada texto se analiza una sola vez.
+ */
+export function compileExpression(expr: string): CompiledExpression {
+  const cached = compiledCache.get(expr);
+  if (cached) {
+    // Refresca la posición en la caché: el orden de inserción del Map marca la antigüedad de uso.
+    compiledCache.delete(expr);
+    compiledCache.set(expr, cached);
+    return cached;
+  }
+  let compiled: CompiledExpression;
+  try {
+    compiled = { ok: true, evaluate: parseExpression(expr) };
+  } catch (err) {
+    compiled = { ok: false, error: err instanceof ExpressionError ? err.message : 'La expresión no es válida.' };
+  }
+  compiledCache.set(expr, compiled);
+  if (compiledCache.size > COMPILED_CACHE_LIMIT) {
+    const oldest = compiledCache.keys().next().value;
+    if (oldest !== undefined) compiledCache.delete(oldest);
+  }
+  return compiled;
+}
+
+/**
+ * Evalúa una expresión aritmética con las variables del alcance y las funciones Math permitidas, sin
+ * ejecutar JavaScript. Con la expresión vacía devuelve el respaldo sin error; si no es válida o su
+ * resultado no es finito, devuelve el respaldo con un mensaje en español.
+ */
 export function safeEvaluateMath(
   expr: string,
   scope: Record<string, number>,
   fallback: number
 ): { value: number; error: string | null } {
+  const withFallback = (message: string) => ({ value: fallback, error: `${message} Se aplica la fórmula de respaldo.` });
+  if (typeof expr !== 'string') return withFallback('La expresión no es un texto.');
+  if (!expr.trim()) return { value: fallback, error: null };
+
+  const compiled = compileExpression(expr);
+  if (!compiled.ok) return withFallback(compiled.error);
   try {
-    if (!expr || !expr.trim()) return { value: fallback, error: null };
-    if (expr.length > 1024) throw new Error('La expresión supera 1024 caracteres.');
-
-    type Token = { kind: 'number' | 'identifier' | 'operator' | 'eof'; value: string };
-    const tokens: Token[] = [];
-    let cursor = 0;
-    while (cursor < expr.length) {
-      const rest = expr.slice(cursor);
-      if (/^\s+/.test(rest)) { cursor += rest.match(/^\s+/)![0].length; continue; }
-      const number = rest.match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/);
-      if (number) { tokens.push({ kind: 'number', value: number[0] }); cursor += number[0].length; continue; }
-      const identifier = rest.match(/^[A-Za-z_][A-Za-z0-9_.]*/);
-      if (identifier) { tokens.push({ kind: 'identifier', value: identifier[0] }); cursor += identifier[0].length; continue; }
-      const operator = rest.match(/^(\*\*|[+\-*/%^(),])/);
-      if (operator) { tokens.push({ kind: 'operator', value: operator[0] }); cursor += operator[0].length; continue; }
-      throw new Error(`Carácter no permitido en la posición ${cursor + 1}.`);
-    }
-    if (tokens.length > 512) throw new Error('La expresión contiene demasiados elementos.');
-    tokens.push({ kind: 'eof', value: '' });
-
-    const functions: Record<string, (...args: number[]) => number> = {
-      'Math.abs': Math.abs, 'Math.sqrt': Math.sqrt, 'Math.pow': Math.pow,
-      'Math.min': Math.min, 'Math.max': Math.max, 'Math.sin': Math.sin,
-      'Math.cos': Math.cos, 'Math.tan': Math.tan, 'Math.asin': Math.asin,
-      'Math.acos': Math.acos, 'Math.atan': Math.atan, 'Math.atan2': Math.atan2,
-      'Math.exp': Math.exp, 'Math.log': Math.log, 'Math.log10': Math.log10,
-      'Math.floor': Math.floor, 'Math.ceil': Math.ceil, 'Math.round': Math.round,
-      'Math.sign': Math.sign, 'Math.hypot': Math.hypot,
-    };
-    const constants: Record<string, number> = { 'Math.PI': Math.PI, 'Math.E': Math.E, pi: Math.PI };
-    let index = 0;
-    let depth = 0;
-    const peek = () => tokens[index];
-    const take = () => tokens[index++];
-    const accept = (value: string) => peek().value === value ? (take(), true) : false;
-    const expect = (value: string) => { if (!accept(value)) throw new Error(`Se esperaba "${value}".`); };
-
-    const primary = (): number => {
-      if (++depth > 100) throw new Error('La expresión está anidada en exceso.');
-      let value: number;
-      const token = peek();
-      if (token.kind === 'number') {
-        value = Number(take().value);
-      } else if (accept('(')) {
-        value = addSub();
-        expect(')');
-      } else if (token.kind === 'identifier') {
-        const name = take().value;
-        if (accept('(')) {
-          const fn = functions[name];
-          if (!fn) throw new Error(`Función no permitida: ${name}. Usa funciones Math admitidas.`);
-          const args: number[] = [];
-          if (!accept(')')) {
-            do { args.push(addSub()); } while (accept(','));
-            expect(')');
-          }
-          value = fn(...args);
-        } else if (Object.prototype.hasOwnProperty.call(scope, name)) {
-          value = scope[name];
-        } else if (Object.prototype.hasOwnProperty.call(constants, name)) {
-          value = constants[name];
-        } else {
-          throw new Error(`Variable no disponible: ${name}.`);
-        }
-      } else {
-        throw new Error('Se esperaba un número, variable o paréntesis.');
-      }
-      depth--;
-      return value;
-    };
-
-    const power = (): number => {
-      const left = primary();
-      if (accept('^') || accept('**')) return Math.pow(left, unary());
-      return left;
-    };
-    const unary = (): number => accept('+') ? unary() : accept('-') ? -unary() : power();
-    const mulDiv = (): number => {
-      let value = unary();
-      while (peek().value === '*' || peek().value === '/' || peek().value === '%') {
-        const op = take().value;
-        const right = unary();
-        value = op === '*' ? value * right : op === '/' ? value / right : value % right;
-      }
-      return value;
-    };
-    const addSub = (): number => {
-      let value = mulDiv();
-      while (peek().value === '+' || peek().value === '-') {
-        const op = take().value;
-        const right = mulDiv();
-        value = op === '+' ? value + right : value - right;
-      }
-      return value;
-    };
-
-    const result = addSub();
-    if (peek().kind !== 'eof') throw new Error(`Elemento inesperado: ${peek().value}.`);
-    if (!Number.isFinite(result)) throw new Error(`El resultado no es finito (${result}).`);
+    const result = compiled.evaluate(scope);
+    if (!Number.isFinite(result)) return withFallback('El resultado no es un número finito.');
     return { value: result, error: null };
-  } catch (err: any) {
-    return {
-      value: fallback,
-      error: `${err?.message || 'Expresión no válida'} Se aplica la fórmula de respaldo.`,
-    };
+  } catch (err) {
+    return withFallback(err instanceof ExpressionError ? err.message : 'No se pudo evaluar la expresión.');
   }
 }
 
@@ -429,8 +692,21 @@ export function checkIfModified(config: CustomEquationsConfig): boolean {
   }
 }
 
+/** Devuelve `value` si es un número finito y `fallback` en cualquier otro caso. */
+export function finiteOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
 /**
- * Calculates custom Soderberg loss coefficient based on configuration.
+ * Coeficiente de pérdida de Soderberg de una fila, con una única forma funcional para la rama por
+ * defecto y la personalizada (así un cambio mínimo de un parámetro produce un cambio mínimo en ζ):
+ *   ζ₀ = a + b·(ε/100)^c − tk·(t/c)/0.20
+ *   F_AR = dStator + eStator/AR (estator)  ·  d + e/AR (rotor)
+ *   ζ  = max[0, (1 + ζ₀)·F_AR − 1]
+ * Con los valores por defecto (tk = 0) ζ₀ = 0.04 + 0.06(ε/100)², la correlación publicada para t/c = 0.20.
+ * Si useCustomFormula, ζ₀ y F_AR salen de las expresiones del usuario (variables eps, AR, row y tc;
+ * row vale 0 en el estator y 1 en el rotor) y la forma paramétrica actúa como respaldo.
+ * `isCustom` solo indica si la configuración difiere de la canónica.
  */
 export function evaluateCustomSoderberg(
   config: CustomEquationsConfig | undefined,
@@ -438,67 +714,65 @@ export function evaluateCustomSoderberg(
   AR: number,
   options: { row?: 'stator' | 'rotor'; tmaxToChord?: number } = {}
 ): { zeta_nominal: number; arFactor: number; zeta_final: number; isCustom: boolean } {
-  const safe_AR = Math.max(0.4, Math.min(10.0, AR));
-  const safe_eps = Math.max(0, Math.min(180, eps_deg));
+  const safe_AR = Math.max(0.4, Math.min(10.0, finiteOr(AR, 1.6)));
+  const safe_eps = Math.max(0, Math.min(180, finiteOr(eps_deg, 0)));
   const row = options.row ?? 'rotor';
-  const safe_t_over_c = Math.max(0, Math.min(0.5, options.tmaxToChord ?? 0.20));
+  const safe_t_over_c = Math.max(0, Math.min(0.5, finiteOr(options.tmaxToChord, 0.20)));
 
-  // Soderberg's published nominal correlation includes a thickness correction.
-  const default_zeta_nom =
-    0.04 + 0.06 * Math.pow(safe_eps / 100, 2) - 0.006 * (safe_t_over_c / 0.20);
-  // The published aspect-ratio constants differ for stator and rotor rows.
-  const default_arFactor = row === 'stator'
-    ? 0.993 + 0.021 / safe_AR
-    : 0.975 + 0.075 / safe_AR;
-
+  const defaults = SAFE_DEFAULT_EQUATIONS.soderberg;
   const s = config?.soderberg;
-  const safeSoderberg = SAFE_DEFAULT_EQUATIONS.soderberg;
-  const hasCustomSoderberg = !!s && s.enabled && (
-    s.useCustomFormula ||
-    s.a !== safeSoderberg.a ||
-    s.b !== safeSoderberg.b ||
-    s.c !== safeSoderberg.c ||
-    s.d !== safeSoderberg.d ||
-    s.e !== safeSoderberg.e
+  const active = s && s.enabled === true ? s : undefined;
+  const params = {
+    a: finiteOr(active?.a, defaults.a),
+    b: finiteOr(active?.b, defaults.b),
+    c: finiteOr(active?.c, defaults.c),
+    d: finiteOr(active?.d, defaults.d),
+    e: finiteOr(active?.e, defaults.e),
+    dStator: finiteOr(active?.dStator, defaults.dStator),
+    eStator: finiteOr(active?.eStator, defaults.eStator),
+    tk: finiteOr(active?.tk, defaults.tk),
+  };
+  const useCustomFormula = active?.useCustomFormula === true;
+  const isCustom = !!active && (
+    useCustomFormula
+    || (Object.keys(params) as (keyof typeof params)[]).some((key) => params[key] !== defaults[key])
   );
 
-  if (!s || !hasCustomSoderberg) {
-    const zeta_final = Math.max(0, (1 + default_zeta_nom) * default_arFactor - 1);
-    return { zeta_nominal: default_zeta_nom, arFactor: default_arFactor, zeta_final, isCustom: false };
-  }
+  const parametricNominal =
+    params.a + params.b * Math.pow(safe_eps / 100, params.c) - params.tk * safe_t_over_c / 0.20;
+  const parametricArFactor = row === 'stator'
+    ? params.dStator + params.eStator / safe_AR
+    : params.d + params.e / safe_AR;
 
-  let zeta_nominal = default_zeta_nom;
-  let arFactor = default_arFactor;
-
-  if (s.useCustomFormula) {
-    const evalNom = safeEvaluateMath(s.customExpression, { eps: safe_eps, AR: safe_AR }, default_zeta_nom);
-    zeta_nominal = evalNom.value;
-    const evalAr = safeEvaluateMath(s.customArExpression, { eps: safe_eps, AR: safe_AR }, default_arFactor);
-    arFactor = evalAr.value;
-  } else {
-    zeta_nominal = s.a + s.b * Math.pow(safe_eps / 100, s.c);
-    arFactor = s.d + s.e / safe_AR;
+  let zeta_nominal = parametricNominal;
+  let arFactor = parametricArFactor;
+  if (useCustomFormula && active) {
+    const scope = { eps: safe_eps, AR: safe_AR, row: row === 'rotor' ? 1 : 0, tc: safe_t_over_c };
+    zeta_nominal = safeEvaluateMath(active.customExpression, scope, parametricNominal).value;
+    arFactor = safeEvaluateMath(active.customArExpression, scope, parametricArFactor).value;
   }
 
   const zeta_final = Math.max(0, (1 + zeta_nominal) * arFactor - 1);
-  return { zeta_nominal, arFactor, zeta_final, isCustom: true };
+  return { zeta_nominal, arFactor, zeta_final, isCustom };
 }
 
 /**
  * Evaluates custom annulus area and blade height applying boundary layer blockage.
+ * Un factor de bloqueo no finito se trata como 0.
  */
 export function evaluateCustomBladeHeight(
   config: CustomEquationsConfig | undefined,
   Area_ideal: number,
   Rm: number
 ): { bladeHeight: number; effectiveArea: number; blockage: number } {
-  const blockage = config?.sizing?.blockageFactor ?? 0.0;
+  const blockage = finiteOr(config?.sizing?.blockageFactor, 0);
   const safeBlockage = Math.max(0, Math.min(0.20, blockage));
-  const safeRm = Math.max(0.01, Rm);
+  const safeRm = Math.max(0.01, finiteOr(Rm, 0.01));
   const defaultArea = Area_ideal / Math.max(0.5, 1.0 - safeBlockage);
   const defaultHeight = defaultArea / (2 * Math.PI * safeRm);
   const sizing = config?.sizing;
-  const customHeight = sizing?.useCustomHeightFormula
+  const useCustomHeightFormula = sizing?.useCustomHeightFormula === true;
+  const customHeight = useCustomHeightFormula && sizing
     ? safeEvaluateMath(sizing.customHeightExpression, {
         Area: Area_ideal,
         Area_ideal,
@@ -508,7 +782,7 @@ export function evaluateCustomBladeHeight(
       }, defaultHeight).value
     : defaultHeight;
   const bladeHeight = Math.max(0.001, Math.min(10, customHeight));
-  const effectiveArea = sizing?.useCustomHeightFormula
+  const effectiveArea = useCustomHeightFormula
     ? 2 * Math.PI * safeRm * bladeHeight
     : defaultArea;
 
@@ -579,6 +853,12 @@ export interface EquationEvaluationContext {
   Ys_rotor: number;
   Ytc_rotor: number;
 }
+
+/**
+ * Espesor relativo t/c con el que la interfaz llama al solver. Las vistas previas del catálogo lo usan
+ * para evaluar Soderberg con la misma t/c y la misma fila (rotor) que el cálculo.
+ */
+export const CATALOG_TMAX_TO_CHORD = 0.20;
 
 export interface EquationNode {
   id: string;
@@ -1172,25 +1452,28 @@ export const EQUATION_CATALOG: EquationNode[] = [
     name: 'Coeficiente Base de Pérdida de Soderberg',
     category: 'losses',
     subfolder: 'Modelos de Pérdidas',
-    latex: '\\zeta_{ref} = 0.04 + 0.06(\\epsilon/100)^2 - 0.006[(t/c)/0.20]',
-    asciiFormula: 'zeta_ref = 0.04 + 0.06*(eps/100)^2 - 0.006*((t/c)/0.20)',
-    description: 'Correlación de referencia de Soderberg con corrección por espesor; en este editor se evalúa con t/c = 0.20. Los parámetros a, b y c representan un ajuste personalizado.',
+    latex: '\\zeta^* = a + b(\\epsilon/100)^c - t_k\\,[(t/c)/0.20] \\;\\; (a=0.04,\\ b=0.06,\\ c=2,\\ t_k=0)',
+    asciiFormula: 'zeta_ref = a + b*(eps/100)^c - tk*((t/c)/0.20); por defecto 0.04 + 0.06*(eps/100)^2',
+    description: 'Correlación nominal de Soderberg para t/c = 0.20, Re = 10⁵ y AR = 3. Por defecto tk = 0, de modo que ζ* = 0.04 + 0.06(ε/100)²; tk permite añadir una corrección lineal por espesor. Los parámetros a, b, c y tk son ajustables.',
     theoreticalRef: 'Soderberg (1949), Dixon & Hall (2014) Cap. 3',
     symbols: [
       { symbol: 'zeta0', name: 'Coeficiente nominal de pérdida de energía cinética', unit: '-' },
-      { symbol: 'eps', name: 'Deflexión total del flujo (|beta1 - beta2|)', unit: '°' },
+      { symbol: 'eps', name: 'Deflexión del flujo en la fila (rotor |β₂ − β₁|, estator |α₁ − α₀|)', unit: '°' },
       { symbol: 'a', name: 'Constante base a deflexión nula (0.04)', unit: '-' },
       { symbol: 'b', name: 'Coeficiente de sensibilidad angular (0.06)', unit: '-' },
       { symbol: 'c', name: 'Exponente cuadrático de deflexión (2.0)', unit: '-' },
+      { symbol: 'tk', name: 'Coeficiente de espesor (0 por defecto)', unit: '-' },
     ],
     editableType: 'soderberg',
     evaluate: (ctx, cfg) => {
-      const s = cfg.soderberg;
-      const usesCustomParameters = s.useCustomFormula || s.a !== SAFE_DEFAULT_EQUATIONS.soderberg.a || s.b !== SAFE_DEFAULT_EQUATIONS.soderberg.b || s.c !== SAFE_DEFAULT_EQUATIONS.soderberg.c;
-      const z0 = usesCustomParameters
-        ? s.a + s.b * Math.pow(ctx.eps_deg / 100, s.c)
-        : 0.04 + 0.06 * Math.pow(ctx.eps_deg / 100, 2) - 0.006;
-      return { outputLabel: 'zeta_ref nominal (t/c = 0.20)', outputValue: z0.toFixed(4), unit: '-', detail: `Deflexión eps = ${ctx.eps_deg.toFixed(1)}°` };
+      const tmaxToChord = CATALOG_TMAX_TO_CHORD;
+      const res = evaluateCustomSoderberg(cfg, ctx.eps_deg, ctx.aspectRatio, { row: 'rotor', tmaxToChord });
+      return {
+        outputLabel: 'ζ* nominal del rotor',
+        outputValue: res.zeta_nominal.toFixed(4),
+        unit: '-',
+        detail: `Deflexión ε = ${ctx.eps_deg.toFixed(1)}°, t/c = ${tmaxToChord.toFixed(2)}`,
+      };
     },
   },
   {
@@ -1198,21 +1481,22 @@ export const EQUATION_CATALOG: EquationNode[] = [
     name: 'Corrección por Relación de Aspecto (Soderberg)',
     category: 'losses',
     subfolder: 'Modelos de Pérdidas',
-    latex: 'Rotor: (1 + \\zeta_{ref})(0.975 + 0.075/AR) - 1; Estator: (1 + \\zeta_{ref})(0.993 + 0.021/AR) - 1',
-    asciiFormula: '1 + zeta = (1 + zeta0) * (d + e / AR)',
-    description: 'La correlación de referencia usa constantes distintas para rotor y estator. La configuración personalizada expone d y e para ajustar el factor de aspecto.',
+    latex: '\\text{Rotor: } (1 + \\zeta^*)(d + e/AR) - 1;\\quad \\text{Estator: } (1 + \\zeta^*)(d_N + e_N/AR) - 1',
+    asciiFormula: 'zeta = (1 + zeta0) * (d + e / AR) - 1  (rotor: d=0.975, e=0.075; estator: dStator=0.993, eStator=0.021)',
+    description: 'La correlación de referencia usa constantes distintas para rotor y estator; ambas son editables. La misma forma se usa con los valores por defecto y con los personalizados.',
     theoreticalRef: 'Soderberg (1949), Stenning (Turbomachines)',
     symbols: [
       { symbol: 'zeta', name: 'Coeficiente total de pérdida de Soderberg', unit: '-' },
       { symbol: 'zeta0', name: 'Pérdida nominal', unit: '-' },
       { symbol: 'AR', name: 'Relación de aspecto (h / c)', unit: '-' },
-      { symbol: 'd', name: 'Intercepto de esbeltez (0.975)', unit: '-' },
-      { symbol: 'e', name: 'Penalización por pared extrema (0.075)', unit: '-' },
+      { symbol: 'd, e', name: 'Constantes de esbeltez del rotor (0.975 y 0.075)', unit: '-' },
+      { symbol: 'dStator, eStator', name: 'Constantes de esbeltez del estator (0.993 y 0.021)', unit: '-' },
     ],
     editableType: 'soderberg',
     evaluate: (ctx, cfg) => {
-      const res = evaluateCustomSoderberg(cfg, ctx.eps_deg, ctx.aspectRatio);
-      return { outputLabel: 'zeta total de Soderberg', outputValue: res.zeta_final.toFixed(4), unit: '-', detail: `Factor AR = ${res.arFactor.toFixed(4)} @ AR=${ctx.aspectRatio.toFixed(2)}` };
+      const tmaxToChord = CATALOG_TMAX_TO_CHORD;
+      const res = evaluateCustomSoderberg(cfg, ctx.eps_deg, ctx.aspectRatio, { row: 'rotor', tmaxToChord });
+      return { outputLabel: 'ζ total de Soderberg del rotor', outputValue: res.zeta_final.toFixed(4), unit: '-', detail: `Factor AR = ${res.arFactor.toFixed(4)} con AR = ${ctx.aspectRatio.toFixed(2)}` };
     },
   },
   {
@@ -1220,9 +1504,9 @@ export const EQUATION_CATALOG: EquationNode[] = [
     name: 'Ainley & Mathieson - Pérdida de Perfil',
     category: 'losses',
     subfolder: 'Modelos de Pérdidas',
-    latex: 'Y_{p,N}=A_N+B_N(|\\beta_2|/100)^{2.4}(s/c)^{-0.4};\\;Y_{p,I}=A_I+B_I(|\\beta_2|/100)^{2.6}(s/c)^{-0.6};\\;Y_p=\\mathrm{clamp}([Y_{p,N}+\\xi^2(Y_{p,I}-Y_{p,N})](t/c/0.20)^\\xi,0.015,0.25)',
-    asciiFormula: 'xi=min(1,abs(beta1)/max(1,abs(beta2))); Yp=clamp((Yp_nozzle+xi^2*(Yp_impulse-Yp_nozzle))*(t/c/0.20)^xi,0.015,0.25)',
-    description: 'Aproximación algebraica implementada por esta app; los cuatro parámetros de perfil y la expresión final pueden editarse. No reproduce los mapas originales completos de Ainley–Mathieson.',
+    latex: 'Y_{p,N}=A_N+B_N(|\\beta_2|/100)^{2.4}(s/c)^{-0.4};\\;Y_{p,I}=A_I+B_I(|\\beta_2|/100)^{2.6}(s/c)^{-0.6};\\;\\xi=\\mathrm{clamp}(-\\mathrm{sgn}(\\beta_2)\\beta_1/\\max(1,|\\beta_2|),0,1);\\;Y_p=\\mathrm{clamp}([Y_{p,N}+\\xi^2(Y_{p,I}-Y_{p,N})](t/c/0.20)^\\xi,0.015,0.25)',
+    asciiFormula: 'xi=clamp(-sign(beta2)*beta1/max(1,abs(beta2)),0,1); Yp=clamp((Yp_nozzle+xi^2*(Yp_impulse-Yp_nozzle))*(t/c/0.20)^xi,0.015,0.25)',
+    description: 'Aproximación algebraica implementada por esta app; los cuatro parámetros de perfil y la expresión final pueden editarse. La fracción de impulso ξ conserva el signo: un ángulo de entrada del mismo lado que la salida (álabe de reacción) se trata como tobera, ξ = 0, que es la opción conservadora; la expresión propia recibe xi (recortado) y xi_signed. No reproduce los mapas originales completos de Ainley–Mathieson.',
     theoreticalRef: 'Ainley & Mathieson (1951) - ARC R&M 2891, Dunham & Came (1970)',
     symbols: [
       { symbol: 'Yp', name: 'Coeficiente de pérdida de presión total de perfil', unit: '-' },
@@ -1240,9 +1524,9 @@ export const EQUATION_CATALOG: EquationNode[] = [
     name: 'Ainley & Mathieson - Pérdida Secundaria',
     category: 'losses',
     subfolder: 'Modelos de Pérdidas',
-    latex: 'Y_s=\\mathrm{clamp}[(K_s/AR)(C_L/(s/c))^2 \\cos^2\\beta_2/\\max(0.02,\\cos^3\\beta_m),0,0.25]',
-    asciiFormula: 'Ys = clamp((secondaryCoeff/AR)*CL_sc^2*cos(b2)^2/max(0.02,cos(bm)^3),0,0.25)',
-    description: 'Pérdida debida a los vórtices de paso generados por el gradiente de presión transversal en las paredes extremas del canal anular.',
+    latex: 'Y_s=\\mathrm{clamp}[(K_s/AR)(C_L/(s/c))^2 \\cos^2\\beta_2/\\max(0.02,\\cos^3\\beta_m)\\cdot|\\cos\\beta_2|/\\max(0.05,|\\cos\\beta_1|),0,0.25]',
+    asciiFormula: 'Ys = clamp((secondaryCoeff/AR)*CL_sc^2*cos(b2)^2/max(0.02,cos(bm)^3)*abs(cos(b2))/max(0.05,abs(cos(b1))),0,0.25)',
+    description: 'Pérdida debida a los vórtices de paso generados por el gradiente de presión transversal en las paredes extremas del canal anular. Incluye el factor cos(salida)/cos(entrada) de Dunham & Came; en el estator los ángulos son α₀ y α₁.',
     theoreticalRef: 'Ainley & Mathieson (1951), Dunham & Came (1970)',
     symbols: [
       { symbol: 'Ys', name: 'Coeficiente de pérdida secundaria', unit: '-' },
@@ -1362,7 +1646,7 @@ export const EQUATION_CATALOG: EquationNode[] = [
     latex: 'f(\\epsilon, AR, \\text{turning}, R_m) = \\dots',
     asciiFormula: 'custom_expression(...)',
     description: 'Entorno de cálculo en tiempo real donde puedes escribir cualquier expresión matemática en JavaScript seguro con acceso al alcance de variables de la etapa.',
-    theoreticalRef: 'Evaluador Seguro de Álgebra de AI Studio Build',
+    theoreticalRef: 'Evaluador de expresiones propio de la aplicación (analizador aritmético, sin eval)',
     symbols: [
       { symbol: 'eps', name: 'Deflexión total en grados', unit: '°' },
       { symbol: 'AR', name: 'Relación de aspecto (h/c)', unit: '-' },
