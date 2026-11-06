@@ -3,574 +3,749 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useRef, useEffect, useState, useMemo } from 'react';
-import {
-  RadialBladeDesign,
-  BladeProfileResult,
-  Point2D,
-} from '../utils/bladeGeometry';
-import {
-  Layers,
-  ZoomIn,
-  ZoomOut,
-  RotateCcw,
-  Sliders,
-  Eye,
-  Info,
-  Maximize2,
-  Copy,
-  Check,
-} from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { RadialBladeDesign, BladeProfileResult, BladeSectionParams, Point2D } from '../utils/bladeGeometry';
+import { Check, Copy, Eye, Info, Layers, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
+import { formatNumber } from '../utils/format';
 
 interface BladeProfileCanvasProps {
   radialDesign: RadialBladeDesign;
   stageName?: string;
-  onParameterChange?: {
-    c_ax_mid: number;
-    set_c_ax_mid: (val: number) => void;
-    psi_Zweifel: number;
-    set_psi_Zweifel: (val: number) => void;
-    incidence_deg: number;
-    set_incidence_deg: (val: number) => void;
-    deviation_deg: number;
-    set_deviation_deg: (val: number) => void;
-    t_max_mid: number;
-    set_t_max_mid: (val: number) => void;
+}
+
+type SectionName = BladeSectionParams['sectionName'];
+type SectionFilter = 'all' | SectionName;
+type Alignment = 'le' | 'centroid' | 'te';
+
+interface ViewState {
+  zoom: number;
+  pan: Point2D;
+}
+
+interface Bounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+interface ViewTransform {
+  scale: number;
+  originX: number;
+  originY: number;
+}
+
+interface ChartPalette {
+  background: string;
+  grid: string;
+  axis: string;
+  text: string;
+  labelBackground: string;
+  accent: string;
+  ss: string;
+  ps: string;
+  sections: Record<SectionName, string>;
+  fontMono: string;
+}
+
+interface VisibleProfile {
+  profile: BladeProfileResult;
+  section: SectionName;
+  offset: Point2D;
+  /** Desplazamientos tangenciales [mm] de las copias de cascada que se dibujan (sin incluir la principal). */
+  cascadeShifts: number[];
+}
+
+/** Límites de zoom compartidos por la rueda, el pellizco y los botones. */
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 6;
+const ZOOM_STEP = 1.2;
+/** Copias de la cascada a cada lado de la sección (máximo 3). */
+const CASCADE_STEPS = 2;
+const MAX_CASCADE_STEPS = 3;
+const VIEW_MARGIN = 0.1;
+/**
+ * Con un área de dibujo de al menos 768 px (contenedor @3xl) la leyenda, las capas y las métricas se superponen al canvas:
+ * se reserva su franja para no tapar el dibujo. Por debajo van bajo el canvas.
+ */
+const OVERLAY_BREAKPOINT_PX = 768;
+const OVERLAY_INSET_TOP_PX = 64;
+const OVERLAY_INSET_BOTTOM_PX = 48;
+const COMPACT_INSET_BOTTOM_PX = 36;
+const FLOW_VECTOR_RATIO = 0.38;
+const CANVAS_FONT_PX = 11;
+const HINT_DURATION_MS = 1600;
+const GRID_STEPS_MM = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+const INITIAL_VIEW: ViewState = { zoom: 1, pan: { x: 0, y: 0 } };
+
+const SECTION_ORDER: SectionName[] = ['Hub', 'Mid', 'Tip'];
+const SECTION_LABEL: Record<SectionName, string> = { Hub: 'Buje', Mid: 'Media', Tip: 'Punta' };
+const SECTION_TOKEN: Record<SectionName, string> = {
+  Hub: 'var(--color-series-hub)',
+  Mid: 'var(--color-series-mid)',
+  Tip: 'var(--color-series-tip)',
+};
+
+const clampZoom = (zoom: number) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom));
+const toRad = (deg: number) => (deg * Math.PI) / 180;
+
+/** Lee los tokens del tema para pintar el canvas con los mismos colores que el resto de la interfaz. */
+function readChartPalette(): ChartPalette {
+  const styles = getComputedStyle(document.documentElement);
+  const read = (token: string, fallback: string) => styles.getPropertyValue(token).trim() || fallback;
+  return {
+    background: '#f8fafc',
+    grid: read('--color-grid', '#e2e8f0'),
+    axis: read('--color-axis', '#94a3b8'),
+    text: read('--color-ink-3', '#526175'),
+    labelBackground: 'rgba(255, 255, 255, 0.88)',
+    accent: read('--color-accent', '#0e7490'),
+    ss: read('--color-series-ss', '#dc2626'),
+    ps: read('--color-series-ps', '#2563eb'),
+    sections: {
+      Hub: read('--color-series-hub', '#0891b2'),
+      Mid: read('--color-series-mid', '#059669'),
+      Tip: read('--color-series-tip', '#d97706'),
+    },
+    fontMono: read('--font-mono', 'ui-monospace, monospace'),
   };
 }
 
-export const BladeProfileCanvas: React.FC<BladeProfileCanvasProps> = ({
-  radialDesign,
-  stageName = 'Etapa 1',
-  onParameterChange,
-}) => {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+/** Desplazamiento que alinea el apilado radial en el borde de ataque, el centroide (media cuerda) o el borde de salida. */
+function getAlignmentOffset(profile: BladeProfileResult, alignment: Alignment): Point2D {
+  if (alignment === 'le') return { x: 0, y: 0 };
+  const fraction = alignment === 'te' ? 1 : 0.5;
+  const x = profile.params.c_ax * fraction;
+  return { x: -x, y: -x * Math.tan(toRad(profile.params.stagger_deg)) };
+}
 
-  // View state
-  const [activeSection, setActiveSection] = useState<'all' | 'Hub' | 'Mid' | 'Tip'>('all');
-  const [alignment, setAlignment] = useState<'le' | 'centroid' | 'te'>('le');
+/** Extremos de los vectores de flujo relativo W₁ (entrada) y W₂ (salida) en mm, ya desplazados. */
+function flowVectorPoints(profile: BladeProfileResult, offset: Point2D) {
+  const { c_ax, stagger_deg, beta_flow_1, beta_flow_2 } = profile.params;
+  const length = c_ax * FLOW_VECTOR_RATIO;
+  const b1 = toRad(beta_flow_1);
+  const b2 = toRad(beta_flow_2);
+  const inletHead = { x: offset.x, y: offset.y };
+  const inletTail = { x: offset.x - length * Math.cos(b1), y: offset.y - length * Math.sin(b1) };
+  const outletTail = { x: c_ax + offset.x, y: c_ax * Math.tan(toRad(stagger_deg)) + offset.y };
+  const outletHead = { x: outletTail.x + length * Math.cos(b2), y: outletTail.y + length * Math.sin(b2) };
+  return { inletTail, inletHead, outletTail, outletHead };
+}
+
+/** Caja envolvente [mm] de lo que realmente se dibuja: contornos, copias de cascada y, si están visibles, los vectores de flujo. */
+function computeBounds(profiles: VisibleProfile[], includeFlowVectors: boolean): Bounds | null {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  const include = (x: number, y: number) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  };
+
+  profiles.forEach(({ profile, offset, cascadeShifts }) => {
+    const contour = profile.curves.fullContour;
+    [0, ...cascadeShifts].forEach((shift) => {
+      contour.forEach((point) => include(point.x + offset.x, point.y + offset.y + shift));
+    });
+    if (includeFlowVectors) {
+      const { inletTail, outletHead } = flowVectorPoints(profile, offset);
+      include(inletTail.x, inletTail.y);
+      include(outletHead.x, outletHead.y);
+    }
+  });
+
+  return Number.isFinite(minX) ? { minX, maxX, minY, maxY } : null;
+}
+
+/** Franja libre de superposiciones [px] y su centro, que es el punto fijo del encuadre y del zoom con botones. */
+function drawingArea(width: number, height: number) {
+  const top = width >= OVERLAY_BREAKPOINT_PX ? OVERLAY_INSET_TOP_PX : 0;
+  const bottom = width >= OVERLAY_BREAKPOINT_PX ? OVERLAY_INSET_BOTTOM_PX : COMPACT_INSET_BOTTOM_PX;
+  const usableHeight = Math.max(height - top - bottom, height * 0.5);
+  return { usableHeight, center: { x: width / 2, y: top + usableHeight / 2 } };
+}
+
+/**
+ * Transformación mm → píxeles: encaja la caja envolvente centrada en la zona libre con un margen del 10 %
+ * y aplica zoom y desplazamiento. La usan tanto el dibujo como la lectura de coordenadas del cursor.
+ */
+function computeViewTransform(width: number, height: number, bounds: Bounds | null, zoom: number, pan: Point2D): ViewTransform {
+  const box = bounds ?? { minX: -10, maxX: 10, minY: -10, maxY: 10 };
+  const { usableHeight, center } = drawingArea(width, height);
+  const spanX = Math.max(box.maxX - box.minX, 1e-3);
+  const spanY = Math.max(box.maxY - box.minY, 1e-3);
+  const usableW = Math.max(width * (1 - 2 * VIEW_MARGIN), 1);
+  const usableH = Math.max(usableHeight * (1 - 2 * VIEW_MARGIN), 1);
+  const scale = Math.min(usableW / spanX, usableH / spanY) * zoom;
+  const centerX = (box.minX + box.maxX) / 2;
+  const centerY = (box.minY + box.maxY) / 2;
+  return {
+    scale,
+    originX: center.x - centerX * scale + pan.x,
+    originY: center.y + centerY * scale + pan.y,
+  };
+}
+
+/**
+ * Nuevo estado de vista al hacer zoom alrededor de un punto de pantalla (cursor, centro del pellizco o centro del canvas):
+ * el punto bajo el cursor se mantiene fijo.
+ */
+function zoomAround(view: ViewState, nextZoom: number, anchor: Point2D, size: { w: number; h: number }): ViewState {
+  const zoom = clampZoom(nextZoom);
+  const ratio = zoom / view.zoom;
+  const { center } = drawingArea(size.w, size.h);
+  const cx = center.x;
+  const cy = center.y;
+  return {
+    zoom,
+    pan: {
+      x: anchor.x - cx - (anchor.x - cx - view.pan.x) * ratio,
+      y: anchor.y - cy - (anchor.y - cy - view.pan.y) * ratio,
+    },
+  };
+}
+
+function niceGridStep(scale: number): number {
+  return GRID_STEPS_MM.find((step) => step * scale >= 28) ?? GRID_STEPS_MM[GRID_STEPS_MM.length - 1];
+}
+
+/**
+ * Texto con un fondo claro detrás, para que se lea sobre la rejilla y los perfiles. Con `swatch`, el
+ * color de la serie se dibuja como una barra a la izquierda y el texto va en `color`: los colores de
+ * serie (buje, media, punta) no llegan a 4,5:1 sobre el fondo con texto de 11 px.
+ */
+function drawLabel(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  color: string,
+  palette: ChartPalette,
+  width: number,
+  height: number,
+  swatch?: string,
+) {
+  const metrics = ctx.measureText(text);
+  const padX = 3;
+  const swatchW = swatch ? 3 : 0;
+  const textOffset = padX + (swatch ? swatchW + 3 : 0);
+  const boxW = metrics.width + textOffset + padX;
+  const boxH = CANVAS_FONT_PX + 5;
+  const left = Math.min(Math.max(x, 2), Math.max(2, width - boxW - 2));
+  const baseline = Math.min(Math.max(y, boxH), height - 4);
+  const top = baseline - CANVAS_FONT_PX - 1;
+  ctx.save();
+  ctx.fillStyle = palette.labelBackground;
+  ctx.fillRect(left, top, boxW, boxH);
+  if (swatch) {
+    ctx.fillStyle = swatch;
+    ctx.fillRect(left + padX, top + 2, swatchW, boxH - 4);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(text, left + textOffset, baseline);
+  ctx.restore();
+}
+
+function drawArrowHead(ctx: CanvasRenderingContext2D, fromX: number, fromY: number, toX: number, toY: number, size: number, color: string) {
+  const angle = Math.atan2(toY - fromY, toX - fromX);
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(toX, toY);
+  ctx.lineTo(toX - size * Math.cos(angle - Math.PI / 6), toY - size * Math.sin(angle - Math.PI / 6));
+  ctx.lineTo(toX - size * Math.cos(angle + Math.PI / 6), toY - size * Math.sin(angle + Math.PI / 6));
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+interface SegmentedOption<T extends string> {
+  value: T;
+  label: string;
+}
+
+function Segmented<T extends string>({ label, options, value, onChange }: { label: string; options: SegmentedOption<T>[]; value: T; onChange: (value: T) => void }) {
+  return (
+    <div role="group" aria-label={label} className="inline-flex flex-wrap items-center gap-1 rounded-lg bg-surface-sunken p-1">
+      {options.map((option) => {
+        const active = option.value === value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(option.value)}
+            className={`px-2.5 py-1 rounded-md text-label font-medium transition-colors focus-visible:outline-2 focus-visible:outline-accent ${
+              active ? 'bg-surface text-accent shadow-sm' : 'text-ink-3 hover:text-ink'
+            }`}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+const SECTION_OPTIONS: SegmentedOption<SectionFilter>[] = [
+  { value: 'all', label: 'Superpuestas' },
+  { value: 'Hub', label: 'Buje' },
+  { value: 'Mid', label: 'Media' },
+  { value: 'Tip', label: 'Punta' },
+];
+
+const ALIGNMENT_OPTIONS: SegmentedOption<Alignment>[] = [
+  { value: 'le', label: 'Borde de ataque' },
+  { value: 'centroid', label: 'Centroide' },
+  { value: 'te', label: 'Borde de salida' },
+];
+
+export const BladeProfileCanvas: React.FC<BladeProfileCanvasProps> = ({ radialDesign, stageName = 'Etapa 1' }) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const hudXRef = useRef<HTMLSpanElement | null>(null);
+  const hudYRef = useRef<HTMLSpanElement | null>(null);
+  const transformRef = useRef<ViewTransform>({ scale: 1, originX: 0, originY: 0 });
+  const sizeRef = useRef({ w: 0, h: 0 });
+  const pointersRef = useRef(new Map<number, Point2D>());
+  const dragRef = useRef<{ start: Point2D; startPan: Point2D } | null>(null);
+  const pinchRef = useRef<{ startDistance: number; startMid: Point2D; startView: ViewState } | null>(null);
+  const viewRef = useRef<ViewState>(INITIAL_VIEW);
+  const hintTimerRef = useRef<number | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  const [activeSection, setActiveSection] = useState<SectionFilter>('all');
+  const [alignment, setAlignment] = useState<Alignment>('le');
   const [showControlPoints, setShowControlPoints] = useState(true);
   const [showCamberLine, setShowCamberLine] = useState(true);
   const [showStaggerLine, setShowStaggerLine] = useState(true);
   const [showCascade, setShowCascade] = useState(true);
   const [showFlowVectors, setShowFlowVectors] = useState(true);
-  const [cascadeBladesCount, setCascadeBladesCount] = useState<number>(2);
+  const [view, setView] = useState<ViewState>(INITIAL_VIEW);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  const [fontsVersion, setFontsVersion] = useState(0);
+  const [wheelHint, setWheelHint] = useState(false);
+  const [layersOpen, setLayersOpen] = useState(false);
+  const [copyState, setCopyState] = useState<{ section: SectionName; ok: boolean } | null>(null);
 
-  // Pan & Zoom
-  const [zoom, setZoom] = useState<number>(1.0);
-  const [pan, setPan] = useState<Point2D>({ x: 0, y: 0 });
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState<Point2D>({ x: 0, y: 0 });
-  const [hoverCoords, setHoverCoords] = useState<{ x: number; y: number } | null>(null);
-  const [copiedSection, setCopiedSection] = useState<string | null>(null);
+  // Copias para los manejadores nativos y de puntero, que no deben volver a registrarse en cada render.
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+  useEffect(() => {
+    sizeRef.current = size;
+  }, [size]);
 
-  const { hub, mid, tip, bladeCount_Z, solidity_mid, pitch_mid_mm, hb_mm, Rm_mm, R_hub_mm, R_tip_mm, psi_Zweifel } =
-    radialDesign;
+  const { hub, mid, tip, bladeCount_Z, solidity_mid, pitch_mid_mm, hb_mm, zweifelLoading } = radialDesign;
 
-  // Compute centroid offsets for stacking alignment
-  const getAlignmentOffset = (profile: BladeProfileResult): Point2D => {
-    if (alignment === 'le') {
-      return { x: 0, y: 0 };
-    }
-    if (alignment === 'te') {
-      const teX = profile.params.c_ax;
-      const teY = profile.params.c_ax * Math.tan((profile.params.stagger_deg * Math.PI) / 180);
-      return { x: -teX, y: -teY };
-    }
-    // Centroid / Stacking axis approximation (mid-chord)
-    const midX = profile.params.c_ax * 0.5;
-    const midY = midX * Math.tan((profile.params.stagger_deg * Math.PI) / 180);
-    return { x: -midX, y: -midY };
-  };
+  const visibleProfiles = useMemo<VisibleProfile[]>(() => {
+    const bySection: Record<SectionName, BladeProfileResult> = { Hub: hub, Mid: mid, Tip: tip };
+    const sections = activeSection === 'all' ? SECTION_ORDER : [activeSection];
+    const steps = Math.min(CASCADE_STEPS, MAX_CASCADE_STEPS);
+    return sections.map((section) => {
+      const profile = bySection[section];
+      const pitch = profile.params.pitch_s;
+      const drawCascade = showCascade && activeSection !== 'all' && Number.isFinite(pitch) && pitch > 0;
+      const cascadeShifts = drawCascade ? Array.from({ length: steps }, (_, k) => [(k + 1) * pitch, -(k + 1) * pitch]).flat() : [];
+      return { profile, section, offset: getAlignmentOffset(profile, alignment), cascadeShifts };
+    });
+  }, [hub, mid, tip, activeSection, alignment, showCascade]);
 
-  // Render to canvas
+  const bounds = useMemo(() => computeBounds(visibleProfiles, showFlowVectors), [visibleProfiles, showFlowVectors]);
+  const transform = useMemo(() => computeViewTransform(size.w, size.h, bounds, view.zoom, view.pan), [size, bounds, view]);
+  const gridStep = niceGridStep(transform.scale);
+  const gridVisible = gridStep * transform.scale >= 8;
+
+  useEffect(() => {
+    transformRef.current = transform;
+  }, [transform]);
+
+  // Tamaño del área de dibujo: se observa el contenedor para redibujar al redimensionar o girar el móvil.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (!rect) return;
+      const next = { w: Math.round(rect.width), h: Math.round(rect.height) };
+      setSize((previous) => (previous.w === next.w && previous.h === next.h ? previous : next));
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  // Redibuja cuando las fuentes autoalojadas terminan de cargar (el canvas no se actualiza solo).
+  useEffect(() => {
+    let cancelled = false;
+    document.fonts?.ready.then(() => {
+      if (!cancelled) setFontsVersion((value) => value + 1);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (hintTimerRef.current !== null) window.clearTimeout(hintTimerRef.current);
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    },
+    [],
+  );
+
+  // Dibujo
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx || size.w === 0 || size.h === 0) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    // Handle high DPI display
+    const { w: width, h: height } = size;
     const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    const width = rect.width;
-    const height = rect.height;
+    const pixelW = Math.round(width * dpr);
+    const pixelH = Math.round(height * dpr);
+    if (canvas.width !== pixelW) canvas.width = pixelW;
+    if (canvas.height !== pixelH) canvas.height = pixelH;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    ctx.scale(dpr, dpr);
+    const palette = readChartPalette();
+    const font = `${CANVAS_FONT_PX}px ${palette.fontMono}`;
+    const { scale, originX, originY } = transform;
+    const toX = (mm: number) => originX + mm * scale;
+    const toY = (mm: number) => originY - mm * scale;
 
-    // Clear background (Dark industrial theme)
-    ctx.fillStyle = '#080d1a';
+    ctx.fillStyle = palette.background;
     ctx.fillRect(0, 0, width, height);
 
-    // Compute bounding box in mm across active profiles to set initial scale
-    const profilesToRender: {
-      profile: BladeProfileResult;
-      color: string;
-      fillColor: string;
-      label: string;
-      dash?: number[];
-    }[] = [];
-
-    if (activeSection === 'all' || activeSection === 'Hub') {
-      profilesToRender.push({
-        profile: hub,
-        color: '#06b6d4', // Cyan
-        fillColor: 'rgba(6, 182, 212, 0.12)',
-        label: 'Hub (Buje)',
-      });
-    }
-    if (activeSection === 'all' || activeSection === 'Mid') {
-      profilesToRender.push({
-        profile: mid,
-        color: '#10b981', // Emerald
-        fillColor: 'rgba(16, 185, 129, 0.14)',
-        label: 'Mid (Medio)',
-      });
-    }
-    if (activeSection === 'all' || activeSection === 'Tip') {
-      profilesToRender.push({
-        profile: tip,
-        color: '#f59e0b', // Amber
-        fillColor: 'rgba(245, 158, 11, 0.12)',
-        label: 'Tip (Punta)',
-      });
-    }
-
-    // Determine scale: mm to pixels
-    const maxAxial = Math.max(hub.params.c_ax, mid.params.c_ax, tip.params.c_ax);
-    const maxPitch = showCascade ? mid.params.pitch_s * (cascadeBladesCount * 1.5) : maxAxial * 1.2;
-    const fitScale = Math.min((width * 0.65) / maxAxial, (height * 0.6) / maxPitch);
-    const currentScale = fitScale * zoom;
-
-    // Origin: Center canvas with pan offset
-    const originX = width * 0.35 + pan.x;
-    const originY = height * 0.5 + pan.y;
-
-    const toCanvasX = (mmX: number) => originX + mmX * currentScale;
-    const toCanvasY = (mmY: number) => originY - mmY * currentScale; // Invert y for standard Cartesian
-
-    // Draw background technical grid
-    const gridSpacingMm = 10; // 10mm grid lines
-    const gridSpacingPx = gridSpacingMm * currentScale;
-
-    if (gridSpacingPx > 12) {
-      ctx.strokeStyle = '#111c33';
+    // Rejilla con paso «redondo» que se adapta al zoom
+    const gridPx = gridStep * scale;
+    if (gridVisible) {
+      ctx.strokeStyle = palette.grid;
       ctx.lineWidth = 1;
-
-      const startGridX = originX % gridSpacingPx;
-      for (let x = startGridX; x < width; x += gridSpacingPx) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, height);
-        ctx.stroke();
+      ctx.beginPath();
+      for (let x = ((originX % gridPx) + gridPx) % gridPx; x < width; x += gridPx) {
+        ctx.moveTo(Math.round(x) + 0.5, 0);
+        ctx.lineTo(Math.round(x) + 0.5, height);
       }
-
-      const startGridY = originY % gridSpacingPx;
-      for (let y = startGridY; y < height; y += gridSpacingPx) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(width, y);
-        ctx.stroke();
+      for (let y = ((originY % gridPx) + gridPx) % gridPx; y < height; y += gridPx) {
+        ctx.moveTo(0, Math.round(y) + 0.5);
+        ctx.lineTo(width, Math.round(y) + 0.5);
       }
+      ctx.stroke();
     }
 
-    // Draw reference axes (Axial X and Pitchwise Y)
-    ctx.strokeStyle = '#1e293b';
-    ctx.lineWidth = 1.5;
+    // Ejes de referencia
+    ctx.save();
+    ctx.strokeStyle = palette.axis;
+    ctx.lineWidth = 1.25;
     ctx.setLineDash([4, 4]);
-
-    // X Axis (Axial direction)
     ctx.beginPath();
     ctx.moveTo(0, originY);
     ctx.lineTo(width, originY);
-    ctx.stroke();
-
-    // Y Axis (Pitchwise direction)
-    ctx.beginPath();
     ctx.moveTo(originX, 0);
     ctx.lineTo(originX, height);
     ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.restore();
 
-    // Axes Labels
-    ctx.fillStyle = '#64748b';
-    ctx.font = '10px "JetBrains Mono", monospace';
-    ctx.fillText('Eje Axial (x) [mm]', width - 130, originY - 8);
-    ctx.fillText('Eje Tangencial (y) [mm]', originX + 8, 16);
+    ctx.font = font;
+    ctx.textBaseline = 'alphabetic';
+    const axisLabelX = 'x axial [mm]';
+    drawLabel(ctx, axisLabelX, width - ctx.measureText(axisLabelX).width - 12, originY - 6, palette.text, palette, width, height);
+    drawLabel(ctx, 'y tangencial [mm]', originX + 6, 18, palette.text, palette, width, height);
 
-    // Function to render a blade profile instance
-    const renderBladeInstance = (
-      prof: BladeProfileResult,
-      offset: Point2D,
-      yShiftMm: number,
-      color: string,
-      fillColor: string,
-      isGhost: boolean = false
-    ) => {
-      const contour = prof.curves.fullContour;
-      if (!contour || contour.length === 0) return;
+    const singleSection = activeSection !== 'all';
 
-      ctx.save();
+    const traceContour = (contour: Point2D[], offset: Point2D, shift: number) => {
       ctx.beginPath();
-      const firstX = toCanvasX(contour[0].x + offset.x);
-      const firstY = toCanvasY(contour[0].y + offset.y + yShiftMm);
-      ctx.moveTo(firstX, firstY);
-
-      for (let i = 1; i < contour.length; i++) {
-        const cx = toCanvasX(contour[i].x + offset.x);
-        const cy = toCanvasY(contour[i].y + offset.y + yShiftMm);
-        ctx.lineTo(cx, cy);
-      }
+      contour.forEach((point, index) => {
+        const x = toX(point.x + offset.x);
+        const y = toY(point.y + offset.y + shift);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
       ctx.closePath();
+    };
 
-      if (isGhost) {
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.02)';
+    visibleProfiles.forEach(({ profile, section, offset, cascadeShifts }, sectionIndex) => {
+      const color = palette.sections[section];
+      const contour = profile.curves.fullContour;
+      if (!contour || contour.length === 0) return;
+      const { c_ax, r_le, r_te, stagger_deg, beta_flow_1, beta_flow_2 } = profile.params;
+
+      // Copias de la cascada (solo con una sección activa)
+      cascadeShifts.forEach((shift) => {
+        ctx.save();
+        traceContour(contour, offset, shift);
+        ctx.globalAlpha = 0.05;
+        ctx.fillStyle = color;
         ctx.fill();
+        ctx.globalAlpha = 0.45;
         ctx.strokeStyle = color;
-        ctx.globalAlpha = 0.35;
         ctx.lineWidth = 1.2;
         ctx.stroke();
-      } else {
-        ctx.fillStyle = fillColor;
-        ctx.fill();
-        ctx.strokeStyle = color;
-        ctx.globalAlpha = 1.0;
-        ctx.lineWidth = 2.2;
-        ctx.stroke();
-      }
-      ctx.restore();
+        ctx.restore();
+      });
 
-      // Throat opening dimension (between adjacent blades if ghost and mid section)
-      if (showCascade && yShiftMm > 0 && prof.params.sectionName === 'Mid') {
-        // Draw pitch line
-        const p1x = toCanvasX(offset.x);
-        const p1y = toCanvasY(offset.y);
-        const p2x = toCanvasX(offset.x);
-        const p2y = toCanvasY(offset.y + yShiftMm);
-
-        ctx.strokeStyle = '#38bdf8';
+      // Paso s entre álabes adyacentes
+      const firstShift = cascadeShifts.find((shift) => shift > 0);
+      if (firstShift !== undefined) {
+        const x = toX(offset.x);
+        const y1 = toY(offset.y);
+        const y2 = toY(offset.y + firstShift);
+        ctx.save();
+        ctx.strokeStyle = palette.accent;
         ctx.lineWidth = 1;
         ctx.setLineDash([2, 3]);
         ctx.beginPath();
-        ctx.moveTo(p1x, p1y);
-        ctx.lineTo(p2x, p2y);
+        ctx.moveTo(x, y1);
+        ctx.lineTo(x, y2);
         ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Label pitch
-        ctx.fillStyle = '#38bdf8';
-        ctx.font = '10px "JetBrains Mono", monospace';
-        ctx.fillText(`s = ${yShiftMm.toFixed(1)} mm`, p1x + 8, (p1y + p2y) / 2);
-      }
-    };
-
-    // Render each profile
-    profilesToRender.forEach(({ profile, color, fillColor }) => {
-      const offset = getAlignmentOffset(profile);
-
-      // Render cascade replicas if enabled
-      if (showCascade && activeSection !== 'all') {
-        const pitch = profile.params.pitch_s;
-        for (let k = 1; k <= cascadeBladesCount; k++) {
-          renderBladeInstance(profile, offset, k * pitch, color, fillColor, true);
-          renderBladeInstance(profile, offset, -k * pitch, color, fillColor, true);
-        }
+        ctx.restore();
+        ctx.font = font;
+        drawLabel(ctx, `s = ${firstShift.toFixed(1)} mm`, x + 8, (y1 + y2) / 2, palette.accent, palette, width, height);
       }
 
-      // Render primary blade profile
-      renderBladeInstance(profile, offset, 0, color, fillColor, false);
+      // Perfil principal
+      ctx.save();
+      traceContour(contour, offset, 0);
+      ctx.globalAlpha = 0.12;
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+      ctx.restore();
 
-      // Camber line
-      if (showCamberLine && profile.curves.camberLine) {
+      // Línea media
+      if (showCamberLine && profile.curves.camberLine.length > 1) {
         ctx.save();
         ctx.strokeStyle = color;
-        ctx.globalAlpha = 0.7;
+        ctx.globalAlpha = 0.75;
         ctx.lineWidth = 1.4;
         ctx.setLineDash([4, 3]);
         ctx.beginPath();
-        profile.curves.camberLine.forEach((pt, idx) => {
-          const cx = toCanvasX(pt.x + offset.x);
-          const cy = toCanvasY(pt.y + offset.y);
-          if (idx === 0) ctx.moveTo(cx, cy);
-          else ctx.lineTo(cx, cy);
+        profile.curves.camberLine.forEach((point, index) => {
+          const x = toX(point.x + offset.x);
+          const y = toY(point.y + offset.y);
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
         });
         ctx.stroke();
         ctx.restore();
       }
 
-      // Stagger chord line
+      // Cuerda / calado
       if (showStaggerLine) {
         ctx.save();
-        ctx.strokeStyle = '#94a3b8';
-        ctx.globalAlpha = 0.5;
+        ctx.strokeStyle = palette.axis;
         ctx.lineWidth = 1;
         ctx.setLineDash([6, 4]);
-
-        const le_x = toCanvasX(profile.params.r_le + offset.x);
-        const le_y = toCanvasY(offset.y);
-        const te_x = toCanvasX(profile.params.c_ax - profile.params.r_te + offset.x);
-        const te_y = toCanvasY(
-          (profile.params.c_ax - profile.params.r_te - profile.params.r_le) *
-            Math.tan((profile.params.stagger_deg * Math.PI) / 180) +
-            offset.y
-        );
-
         ctx.beginPath();
-        ctx.moveTo(le_x, le_y);
-        ctx.lineTo(te_x, te_y);
+        ctx.moveTo(toX(r_le + offset.x), toY(offset.y));
+        ctx.lineTo(toX(c_ax - r_te + offset.x), toY((c_ax - r_te - r_le) * Math.tan(toRad(stagger_deg)) + offset.y));
         ctx.stroke();
         ctx.restore();
       }
 
-      // Bézier Control Points & Polygons
-      if (showControlPoints && (activeSection === profile.params.sectionName || activeSection === 'all')) {
-        const ss = profile.controlPoints.suctionSide;
-        const ps = profile.controlPoints.pressureSide;
-
-        // Draw Suction Side control polygon
-        ctx.save();
-        ctx.strokeStyle = 'rgba(239, 68, 68, 0.45)'; // red for SS
-        ctx.lineWidth = 1;
-        ctx.setLineDash([2, 2]);
-        ctx.beginPath();
-        ss.forEach((pt, i) => {
-          const cx = toCanvasX(pt.x + offset.x);
-          const cy = toCanvasY(pt.y + offset.y);
-          if (i === 0) ctx.moveTo(cx, cy);
-          else ctx.lineTo(cx, cy);
-        });
-        ctx.stroke();
-
-        // Control nodes SS
-        ss.forEach((pt, i) => {
-          const cx = toCanvasX(pt.x + offset.x);
-          const cy = toCanvasY(pt.y + offset.y);
-          ctx.fillStyle = '#ef4444';
+      // Polígonos de control de Bézier (etiquetas solo con una sección activa, para no saturar)
+      if (showControlPoints) {
+        const sides: { points: Point2D[]; color: string; suffix: string; dy: number }[] = [
+          { points: profile.controlPoints.suctionSide, color: palette.ss, suffix: 'ss', dy: -5 },
+          { points: profile.controlPoints.pressureSide, color: palette.ps, suffix: 'ps', dy: 14 },
+        ];
+        sides.forEach(({ points, color: sideColor, suffix, dy }) => {
+          ctx.save();
+          ctx.strokeStyle = sideColor;
+          ctx.globalAlpha = 0.5;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 2]);
           ctx.beginPath();
-          ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
-          ctx.fill();
+          points.forEach((point, index) => {
+            const x = toX(point.x + offset.x);
+            const y = toY(point.y + offset.y);
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+          ctx.restore();
 
-          ctx.fillStyle = '#fca5a5';
-          ctx.font = '8px "JetBrains Mono", monospace';
-          ctx.fillText(`P${i}_ss`, cx + 5, cy - 4);
+          points.forEach((point, index) => {
+            const x = toX(point.x + offset.x);
+            const y = toY(point.y + offset.y);
+            ctx.fillStyle = sideColor;
+            ctx.beginPath();
+            ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+            if (singleSection) {
+              ctx.font = font;
+              drawLabel(ctx, `P${index}_${suffix}`, x + 5, y + dy, sideColor, palette, width, height);
+            }
+          });
         });
-
-        // Draw Pressure Side control polygon
-        ctx.strokeStyle = 'rgba(59, 130, 246, 0.45)'; // blue for PS
-        ctx.beginPath();
-        ps.forEach((pt, i) => {
-          const cx = toCanvasX(pt.x + offset.x);
-          const cy = toCanvasY(pt.y + offset.y);
-          if (i === 0) ctx.moveTo(cx, cy);
-          else ctx.lineTo(cx, cy);
-        });
-        ctx.stroke();
-
-        // Control nodes PS
-        ps.forEach((pt, i) => {
-          const cx = toCanvasX(pt.x + offset.x);
-          const cy = toCanvasY(pt.y + offset.y);
-          ctx.fillStyle = '#3b82f6';
-          ctx.beginPath();
-          ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
-          ctx.fill();
-
-          ctx.fillStyle = '#93c5fd';
-          ctx.font = '8px "JetBrains Mono", monospace';
-          ctx.fillText(`P${i}_ps`, cx + 5, cy + 10);
-        });
-        ctx.restore();
       }
 
-      // Flow vectors (Relative flow W1 and W2)
+      // Vectores de flujo relativo W₁ y W₂; en vista superpuesta las etiquetas se escalonan por sección
       if (showFlowVectors) {
-        ctx.save();
-        const vecLen = profile.params.c_ax * 0.38;
+        const { inletTail, inletHead, outletTail, outletHead } = flowVectorPoints(profile, offset);
+        const labelShift = singleSection ? 0 : sectionIndex * (CANVAS_FONT_PX + 6);
+        const segments: [Point2D, Point2D][] = [
+          [inletTail, inletHead],
+          [outletTail, outletHead],
+        ];
+        segments.forEach(([from, to]) => {
+          const fx = toX(from.x);
+          const fy = toY(from.y);
+          const tx = toX(to.x);
+          const ty = toY(to.y);
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(fx, fy);
+          ctx.lineTo(tx, ty);
+          ctx.stroke();
+          ctx.restore();
+          drawArrowHead(ctx, fx, fy, tx, ty, 6, color);
+        });
 
-        // Inlet vector W1
-        const b1_rad = (profile.params.beta_flow_1 * Math.PI) / 180;
-        const in_x = toCanvasX(offset.x);
-        const in_y = toCanvasY(offset.y);
-        const in_dx = toCanvasX(offset.x - vecLen * Math.cos(b1_rad));
-        const in_dy = toCanvasY(offset.y - vecLen * Math.sin(b1_rad));
-
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(in_dx, in_dy);
-        ctx.lineTo(in_x, in_y);
-        ctx.stroke();
-
-        // Inlet arrowhead
-        drawArrowHead(ctx, in_dx, in_dy, in_x, in_y, 6, color);
-
-        ctx.fillStyle = color;
-        ctx.font = '9px "JetBrains Mono", monospace';
-        ctx.fillText(
-          `β₁=${profile.params.beta_flow_1.toFixed(1)}°`,
-          in_dx - 35,
-          in_dy - 6
+        ctx.font = font;
+        // Texto en tinta (AA) y el color de la sección solo en la barra de la etiqueta.
+        const inletText = `β₁ = ${formatNumber(beta_flow_1, 1)}°`;
+        drawLabel(
+          ctx,
+          inletText,
+          toX(inletTail.x) - ctx.measureText(inletText).width - 16,
+          toY(inletTail.y) - 6 - labelShift,
+          palette.text,
+          palette,
+          width,
+          height,
+          color,
         );
-
-        // Outlet vector W2
-        const b2_rad = (profile.params.beta_flow_2 * Math.PI) / 180;
-        const out_x = toCanvasX(profile.params.c_ax + offset.x);
-        const out_y = toCanvasY(
-          profile.params.c_ax * Math.tan((profile.params.stagger_deg * Math.PI) / 180) + offset.y
+        drawLabel(
+          ctx,
+          `β₂ = ${formatNumber(beta_flow_2, 1)}°`,
+          toX(outletHead.x) + 8,
+          toY(outletHead.y) + 14 + labelShift,
+          palette.text,
+          palette,
+          width,
+          height,
+          color,
         );
-        const out_dx = toCanvasX(profile.params.c_ax + offset.x + vecLen * Math.cos(b2_rad));
-        const out_dy = toCanvasY(
-          profile.params.c_ax * Math.tan((profile.params.stagger_deg * Math.PI) / 180) +
-            offset.y +
-            vecLen * Math.sin(b2_rad)
-        );
-
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(out_x, out_y);
-        ctx.lineTo(out_dx, out_dy);
-        ctx.stroke();
-
-        drawArrowHead(ctx, out_x, out_y, out_dx, out_dy, 6, color);
-
-        ctx.fillText(
-          `β₂=${profile.params.beta_flow_2.toFixed(1)}°`,
-          out_dx + 8,
-          out_dy + 4
-        );
-        ctx.restore();
       }
     });
+  }, [size, transform, gridStep, gridVisible, visibleProfiles, activeSection, showControlPoints, showCamberLine, showStaggerLine, showFlowVectors, fontsVersion]);
 
-    // Helper: draw arrow head
-    function drawArrowHead(
-      context: CanvasRenderingContext2D,
-      fromX: number,
-      fromY: number,
-      toX: number,
-      toY: number,
-      size: number,
-      arrowColor: string
-    ) {
-      const angle = Math.atan2(toY - fromY, toX - fromX);
-      context.save();
-      context.fillStyle = arrowColor;
-      context.beginPath();
-      context.moveTo(toX, toY);
-      context.lineTo(
-        toX - size * Math.cos(angle - Math.PI / 6),
-        toY - size * Math.sin(angle - Math.PI / 6)
-      );
-      context.lineTo(
-        toX - size * Math.cos(angle + Math.PI / 6),
-        toY - size * Math.sin(angle + Math.PI / 6)
-      );
-      context.closePath();
-      context.fill();
-      context.restore}
+  const showWheelHint = useCallback(() => {
+    setWheelHint(true);
+    if (hintTimerRef.current !== null) window.clearTimeout(hintTimerRef.current);
+    hintTimerRef.current = window.setTimeout(() => setWheelHint(false), HINT_DURATION_MS);
+  }, []);
 
-    // Legend in upper left corner
-    ctx.save();
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-    ctx.strokeStyle = '#334155';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(16, 16, 210, 100, 8);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = 'bold 11px "Plus Jakarta Sans", sans-serif';
-    ctx.fillText('SECCIONES RADIALES (VÓRTICE LIBRE)', 28, 34);
-
-    profilesToRender.forEach((p, idx) => {
-      const ly = 54 + idx * 20;
-      ctx.fillStyle = p.color;
-      ctx.beginPath();
-      ctx.arc(36, ly, 5, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = '#cbd5e1';
-      ctx.font = '10px "JetBrains Mono", monospace';
-      ctx.fillText(
-        `${p.label} - r/Rm=${p.profile.params.r_ratio.toFixed(2)} (${(p.profile.params.radius * 1000).toFixed(0)}mm)`,
-        48,
-        ly + 3
-      );
-    });
-    ctx.restore();
-  }, [
-    hub,
-    mid,
-    tip,
-    activeSection,
-    alignment,
-    showControlPoints,
-    showCamberLine,
-    showStaggerLine,
-    showCascade,
-    showFlowVectors,
-    cascadeBladesCount,
-    zoom,
-    pan,
-  ]);
-
-  // Mouse interaction handlers for Pan & Zoom
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    setIsDragging(true);
-    setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (isDragging) {
-      setPan({
-        x: e.clientX - dragStart.x,
-        y: e.clientY - dragStart.y,
-      });
-    }
-
-    // Coordinates tooltip in mm
+  // Rueda nativa (no pasiva): solo amplía con Ctrl/Cmd o pellizco del trackpad; si no, la página se desplaza normalmente.
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) {
+        showWheelHint();
+        return;
+      }
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      const factor = Math.exp(-event.deltaY * (event.deltaMode === 1 ? 0.05 : 0.0025));
+      setView((current) => zoomAround(current, current.zoom * factor, anchor, sizeRef.current));
+    };
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', handleWheel);
+  }, [showWheelHint]);
+
+  const updateHud = (clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !hudXRef.current || !hudYRef.current) return;
     const rect = canvas.getBoundingClientRect();
-    const xPx = e.clientX - rect.left;
-    const yPx = e.clientY - rect.top;
-
-    const width = rect.width;
-    const height = rect.height;
-    const maxAxial = Math.max(hub.params.c_ax, mid.params.c_ax, tip.params.c_ax);
-    const maxPitch = showCascade ? mid.params.pitch_s * (cascadeBladesCount * 1.5) : maxAxial * 1.2;
-    const fitScale = Math.min((width * 0.65) / maxAxial, (height * 0.6) / maxPitch);
-    const currentScale = fitScale * zoom;
-    const originX = width * 0.35 + pan.x;
-    const originY = height * 0.5 + pan.y;
-
-    const mmX = (xPx - originX) / currentScale;
-    const mmY = (originY - yPx) / currentScale;
-
-    setHoverCoords({ x: mmX, y: mmY });
+    const { scale, originX, originY } = transformRef.current;
+    hudXRef.current.textContent = ((clientX - rect.left - originX) / scale).toFixed(1);
+    hudYRef.current.textContent = ((originY - (clientY - rect.top)) / scale).toFixed(1);
   };
 
-  const handleMouseUp = () => {
-    setIsDragging(false);
+  const clearHud = () => {
+    if (hudXRef.current) hudXRef.current.textContent = '—';
+    if (hudYRef.current) hudYRef.current.textContent = '—';
   };
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
-    setZoom((prev) => Math.max(0.4, Math.min(6.0, prev * zoomFactor)));
+  const localPoint = (event: React.PointerEvent<HTMLCanvasElement>): Point2D => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   };
 
-  const resetView = () => {
-    setZoom(1.0);
-    setPan({ x: 0, y: 0 });
+  const startPinch = () => {
+    const [a, b] = [...pointersRef.current.values()];
+    if (!a || !b) return;
+    pinchRef.current = {
+      startDistance: Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)),
+      startMid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      startView: viewRef.current,
+    };
   };
 
-  // Copy coordinates JSON
+  const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    pointersRef.current.set(event.pointerId, localPoint(event));
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // El puntero ya no está activo (p. ej. se soltó antes de procesar el evento): seguimos sin captura.
+    }
+    if (event.pointerType === 'touch') {
+      // Un dedo desplaza la página; desplazamiento y zoom del dibujo solo con dos.
+      if (pointersRef.current.size === 2) startPinch();
+      return;
+    }
+    dragRef.current = { start: { x: event.clientX, y: event.clientY }, startPan: viewRef.current.pan };
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType !== 'touch') updateHud(event.clientX, event.clientY);
+    if (!pointersRef.current.has(event.pointerId)) return;
+    pointersRef.current.set(event.pointerId, localPoint(event));
+
+    const pinch = pinchRef.current;
+    if (pinch && pointersRef.current.size >= 2) {
+      const [a, b] = [...pointersRef.current.values()];
+      const distance = Math.max(1, Math.hypot(b.x - a.x, b.y - a.y));
+      const midPoint = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const zoomed = zoomAround(pinch.startView, pinch.startView.zoom * (distance / pinch.startDistance), pinch.startMid, sizeRef.current);
+      setView({ zoom: zoomed.zoom, pan: { x: zoomed.pan.x + midPoint.x - pinch.startMid.x, y: zoomed.pan.y + midPoint.y - pinch.startMid.y } });
+      return;
+    }
+
+    const drag = dragRef.current;
+    if (drag) {
+      setView((current) => ({
+        zoom: current.zoom,
+        pan: { x: drag.startPan.x + event.clientX - drag.start.x, y: drag.startPan.y + event.clientY - drag.start.y },
+      }));
+    }
+  };
+
+  const handlePointerEnd = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    pointersRef.current.delete(event.pointerId);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (pointersRef.current.size < 2) pinchRef.current = null;
+    if (pointersRef.current.size === 0) dragRef.current = null;
+  };
+
+  const zoomFromCenter = (factor: number) => {
+    setView((current) => zoomAround(current, current.zoom * factor, drawingArea(sizeRef.current.w, sizeRef.current.h).center, sizeRef.current));
+  };
+
   const handleCopyProfilePoints = (section: BladeProfileResult) => {
     const data = {
       sectionName: section.params.sectionName,
@@ -582,363 +757,222 @@ export const BladeProfileCanvas: React.FC<BladeProfileCanvasProps> = ({
       pressureSide: section.curves.pressureSide,
       camberLine: section.curves.camberLine,
     };
-    navigator.clipboard.writeText(JSON.stringify(data, null, 2));
-    setCopiedSection(section.params.sectionName);
-    setTimeout(() => setCopiedSection(null), 2000);
+    const name = section.params.sectionName;
+    const finish = (ok: boolean) => {
+      setCopyState({ section: name, ok });
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => setCopyState(null), 2000);
+    };
+    if (!navigator.clipboard) {
+      finish(false);
+      return;
+    }
+    navigator.clipboard.writeText(JSON.stringify(data, null, 2)).then(
+      () => finish(true),
+      () => finish(false),
+    );
   };
 
+  const layerToggles: { label: string; checked: boolean; onChange: (value: boolean) => void; hint?: string }[] = [
+    { label: 'Puntos de Bézier (P0–P3)', checked: showControlPoints, onChange: setShowControlPoints },
+    { label: 'Línea media', checked: showCamberLine, onChange: setShowCamberLine },
+    { label: 'Cuerda y calado (γ)', checked: showStaggerLine, onChange: setShowStaggerLine },
+    { label: 'Cascada (paso de Zweifel)', checked: showCascade, onChange: setShowCascade, hint: activeSection === 'all' ? 'Elige una sección para verla' : undefined },
+    { label: 'Vectores de flujo (W₁, W₂)', checked: showFlowVectors, onChange: setShowFlowVectors },
+  ];
+
+  const metrics = [
+    { label: 'Álabes', value: `Z = ${bladeCount_Z}` },
+    { label: 'Solidez', value: `σ = ${formatNumber(solidity_mid, 2)}` },
+    { label: 'Paso', value: `s = ${formatNumber(pitch_mid_mm, 1)} mm` },
+    { label: 'Zweifel', value: `ψ_Z = ${formatNumber(zweifelLoading, 2)}` },
+  ];
+
+  const iconButton =
+    'p-1.5 rounded-md text-ink-2 hover:bg-surface hover:text-ink focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-40 disabled:cursor-not-allowed';
+
   return (
-    <div className="bg-[#0b1329] border border-cyan-900/40 rounded-xl overflow-hidden shadow-2xl flex flex-col">
-      {/* Header with Title & Controls */}
-      <div className="bg-[#0f172a] px-5 py-3.5 border-b border-cyan-900/40 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
-            <Layers className="w-4 h-4" />
-          </div>
-          <div>
-            <h3 className="text-sm font-semibold text-white tracking-wide flex items-center gap-2">
-              Geometría de Álabe 2D / Quasi-3D Bézier
-              <span className="text-[10px] font-mono uppercase bg-cyan-950 text-cyan-400 px-2 py-0.5 rounded border border-cyan-800/60">
-                {stageName}
-              </span>
+    <div className="bg-surface border border-line rounded-card shadow-card overflow-hidden flex flex-col min-w-0">
+      <div className="px-4 sm:px-5 py-3 border-b border-line flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="w-8 h-8 shrink-0 rounded-lg bg-accent-soft flex items-center justify-center text-accent-strong">
+            <Layers className="w-4 h-4" aria-hidden="true" />
+          </span>
+          <div className="min-w-0">
+            <h3 className="text-title font-semibold text-ink flex flex-wrap items-center gap-2">
+              Perfil del álabe del rotor
+              <span className="text-caption font-medium bg-accent-soft text-accent-strong px-2 py-0.5 rounded-md">{stageName}</span>
             </h3>
-            <p className="text-xs text-slate-400">
-              Curvas de Bézier de 4 puntos (Intradós/Extradós) · Vórtice Libre (r · V_θ = const) · Criterio de Zweifel
+            <p className="text-caption text-ink-3">
+              Bézier de 4 puntos (extradós e intradós) · vórtice libre (r·V<sub>θ</sub> = cte.) · criterio de Zweifel
             </p>
           </div>
         </div>
 
-        {/* View Mode & Alignment Selector */}
         <div className="flex flex-wrap items-center gap-2">
-          {/* Section Selector */}
-          <div className="bg-[#080d1a] border border-slate-700/60 rounded-lg p-1 flex items-center gap-1 text-xs">
-            {(['all', 'Hub', 'Mid', 'Tip'] as const).map((sec) => (
-              <button
-                key={sec}
-                onClick={() => setActiveSection(sec)}
-                className={`px-2.5 py-1 rounded font-medium transition-all ${
-                  activeSection === sec
-                    ? 'bg-cyan-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-                }`}
-              >
-                {sec === 'all' ? 'Superpuestas (3D)' : sec}
-              </button>
-            ))}
+          <Segmented label="Sección radial" options={SECTION_OPTIONS} value={activeSection} onChange={setActiveSection} />
+          <div className="inline-flex flex-wrap items-center gap-1">
+            <span className="text-caption text-ink-3 px-1">Apilado</span>
+            <Segmented label="Apilado radial" options={ALIGNMENT_OPTIONS} value={alignment} onChange={setAlignment} />
           </div>
-
-          {/* Stacking Alignment */}
-          <div className="bg-[#080d1a] border border-slate-700/60 rounded-lg p-1 flex items-center gap-1 text-xs">
-            <span className="text-[10px] font-mono text-slate-400 px-1.5">Apilado:</span>
-            {[
-              { id: 'le', label: 'Borde Ataque' },
-              { id: 'centroid', label: 'Eje Centroide' },
-              { id: 'te', label: 'Borde Salida' },
-            ].map((opt) => (
-              <button
-                key={opt.id}
-                onClick={() => setAlignment(opt.id as any)}
-                className={`px-2 py-1 rounded text-xs transition-all ${
-                  alignment === opt.id
-                    ? 'bg-slate-700 text-cyan-300 font-semibold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Zoom Controls */}
-          <div className="flex items-center gap-1 bg-[#080d1a] border border-slate-700/60 rounded-lg p-1">
-            <button
-              onClick={() => setZoom((z) => Math.min(5.0, z * 1.2))}
-              title="Acercar (Zoom In)"
-              className="p-1.5 rounded hover:bg-slate-800 text-slate-300 hover:text-white"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
+          <div role="group" aria-label="Zoom" className="inline-flex items-center gap-1 rounded-lg bg-surface-sunken p-1">
+            <button type="button" onClick={() => zoomFromCenter(ZOOM_STEP)} disabled={view.zoom >= ZOOM_MAX} aria-label="Acercar" title="Acercar" className={iconButton}>
+              <ZoomIn className="w-4 h-4" aria-hidden="true" />
             </button>
-            <button
-              onClick={() => setZoom((z) => Math.max(0.4, z * 0.8))}
-              title="Alejar (Zoom Out)"
-              className="p-1.5 rounded hover:bg-slate-800 text-slate-300 hover:text-white"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
+            <button type="button" onClick={() => zoomFromCenter(1 / ZOOM_STEP)} disabled={view.zoom <= ZOOM_MIN} aria-label="Alejar" title="Alejar" className={iconButton}>
+              <ZoomOut className="w-4 h-4" aria-hidden="true" />
             </button>
-            <button
-              onClick={resetView}
-              title="Restablecer Vista"
-              className="p-1.5 rounded hover:bg-slate-800 text-slate-300 hover:text-white"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
+            <button type="button" onClick={() => setView(INITIAL_VIEW)} aria-label="Restablecer la vista" title="Restablecer la vista" className={iconButton}>
+              <RotateCcw className="w-4 h-4" aria-hidden="true" />
             </button>
           </div>
         </div>
       </div>
 
-      {/* Main Interactive Canvas Area */}
-      <div className="relative w-full h-[520px] bg-[#070b16] select-none overflow-hidden">
-        <canvas
-          ref={canvasRef}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
-          onWheel={handleWheel}
-          className="w-full h-full cursor-grab active:cursor-grabbing block"
-        />
+      {/* Área de dibujo. Si es estrecha, la leyenda, las capas y las métricas van debajo; si es ancha (@3xl), superpuestas. */}
+      <div className="relative @container">
+        <div ref={containerRef} className="relative w-full h-[380px] sm:h-[460px] xl:h-[520px] bg-surface-muted select-none overflow-hidden">
+          <canvas
+            ref={canvasRef}
+            role="img"
+            aria-label={`Perfil 2D del rotor de ${stageName}: secciones de buje, media y punta, ${bladeCount_Z} álabes, paso medio ${pitch_mid_mm.toFixed(1)} mm`}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerEnd}
+            onPointerCancel={handlePointerEnd}
+            onPointerLeave={clearHud}
+            className="block w-full h-full touch-pan-y cursor-grab active:cursor-grabbing"
+          />
 
-        {/* Floating Toggles Overlay */}
-        <div className="absolute top-4 right-4 bg-[#0f172a]/90 backdrop-blur-md border border-slate-700/70 rounded-lg p-3 text-xs space-y-2 text-slate-300 shadow-xl max-w-[200px]">
-          <div className="text-[10px] font-mono uppercase text-slate-400 tracking-wider mb-1 flex items-center gap-1">
-            <Eye className="w-3 h-3 text-cyan-400" />
-            Capas Visuales
-          </div>
+          {wheelHint && (
+            <p role="status" className="absolute top-3 left-1/2 -translate-x-1/2 rounded-lg bg-surface/95 border border-line px-3 py-1.5 text-label text-ink-2 shadow-card pointer-events-none">
+              Ctrl + rueda para ampliar
+            </p>
+          )}
 
-          <label className="flex items-center gap-2 cursor-pointer hover:text-white">
-            <input
-              type="checkbox"
-              checked={showControlPoints}
-              onChange={(e) => setShowControlPoints(e.target.checked)}
-              className="rounded bg-slate-800 border-slate-600 text-cyan-500 focus:ring-0 w-3.5 h-3.5"
-            />
-            <span>Puntos Bézier (P0-P3)</span>
-          </label>
-
-          <label className="flex items-center gap-2 cursor-pointer hover:text-white">
-            <input
-              type="checkbox"
-              checked={showCamberLine}
-              onChange={(e) => setShowCamberLine(e.target.checked)}
-              className="rounded bg-slate-800 border-slate-600 text-cyan-500 focus:ring-0 w-3.5 h-3.5"
-            />
-            <span>Línea Media (Camber)</span>
-          </label>
-
-          <label className="flex items-center gap-2 cursor-pointer hover:text-white">
-            <input
-              type="checkbox"
-              checked={showStaggerLine}
-              onChange={(e) => setShowStaggerLine(e.target.checked)}
-              className="rounded bg-slate-800 border-slate-600 text-cyan-500 focus:ring-0 w-3.5 h-3.5"
-            />
-            <span>Cuerda / Calado (γ)</span>
-          </label>
-
-          <label className="flex items-center gap-2 cursor-pointer hover:text-white">
-            <input
-              type="checkbox"
-              checked={showCascade}
-              onChange={(e) => setShowCascade(e.target.checked)}
-              className="rounded bg-slate-800 border-slate-600 text-cyan-500 focus:ring-0 w-3.5 h-3.5"
-            />
-            <span>Cascada (Paso Zweifel)</span>
-          </label>
-
-          <label className="flex items-center gap-2 cursor-pointer hover:text-white">
-            <input
-              type="checkbox"
-              checked={showFlowVectors}
-              onChange={(e) => setShowFlowVectors(e.target.checked)}
-              className="rounded bg-slate-800 border-slate-600 text-cyan-500 focus:ring-0 w-3.5 h-3.5"
-            />
-            <span>Vectores de Flujo (W₁, W₂)</span>
-          </label>
-        </div>
-
-        {/* Bottom Coordinates HUD */}
-        <div className="absolute bottom-3 left-4 bg-[#0f172a]/85 backdrop-blur-md border border-slate-700/60 rounded-md px-3 py-1.5 font-mono text-[11px] text-slate-300 flex items-center gap-4">
-          <span>
-            X: <strong className="text-cyan-400">{hoverCoords ? hoverCoords.x.toFixed(1) : '0.0'} mm</strong>
-          </span>
-          <span>
-            Y: <strong className="text-cyan-400">{hoverCoords ? hoverCoords.y.toFixed(1) : '0.0'} mm</strong>
-          </span>
-          <span className="text-slate-500">|</span>
-          <span className="text-slate-400">
-            Escala: <strong>{zoom.toFixed(2)}x</strong>
-          </span>
-        </div>
-
-        {/* Zweifel Solidity KPI Badge */}
-        <div className="absolute bottom-3 right-4 bg-emerald-950/80 backdrop-blur-md border border-emerald-600/40 rounded-md px-3 py-1.5 font-mono text-[11px] text-emerald-300 flex items-center gap-3">
-          <span>
-            Álabes <strong className="text-white">Z = {bladeCount_Z}</strong>
-          </span>
-          <span className="text-emerald-500/60">•</span>
-          <span>
-            Solidez <strong className="text-white">σ = {solidity_mid.toFixed(2)}</strong>
-          </span>
-          <span className="text-emerald-500/60">•</span>
-          <span>
-            Paso <strong className="text-white">s = {pitch_mid_mm.toFixed(1)} mm</strong>
-          </span>
-          <span className="text-emerald-500/60">•</span>
-          <span>
-            Zweifel <strong className="text-white">ψ_Z = {psi_Zweifel.toFixed(2)}</strong>
-          </span>
-        </div>
-      </div>
-
-      {/* Interactive Controls & Parameters Table */}
-      <div className="p-5 bg-[#090e1f] border-t border-cyan-900/40 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Sliders if onParameterChange provided */}
-        {onParameterChange && (
-          <div className="bg-[#0f172a] p-4 rounded-lg border border-slate-800 space-y-3">
-            <h4 className="text-xs font-semibold text-cyan-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Sliders className="w-3.5 h-3.5" />
-              Sintonía Geométrica Rápida
-            </h4>
-
-            {/* C_ax */}
-            <div>
-              <div className="flex justify-between text-xs text-slate-300 mb-1">
-                <span>Cuerda Axial (c_ax)</span>
-                <span className="font-mono text-cyan-400">{onParameterChange.c_ax_mid.toFixed(1)} mm</span>
-              </div>
-              <input
-                type="range"
-                min="15"
-                max="100"
-                step="1"
-                value={onParameterChange.c_ax_mid}
-                onChange={(e) => onParameterChange.set_c_ax_mid(parseFloat(e.target.value))}
-                className="w-full accent-cyan-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
-              />
-            </div>
-
-            {/* Zweifel Target */}
-            <div>
-              <div className="flex justify-between text-xs text-slate-300 mb-1">
-                <span>Coeficiente Zweifel (ψ_Z)</span>
-                <span className="font-mono text-emerald-400">{onParameterChange.psi_Zweifel.toFixed(2)}</span>
-              </div>
-              <input
-                type="range"
-                min="0.65"
-                max="1.20"
-                step="0.05"
-                value={onParameterChange.psi_Zweifel}
-                onChange={(e) => onParameterChange.set_psi_Zweifel(parseFloat(e.target.value))}
-                className="w-full accent-emerald-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
-              />
-            </div>
-
-            {/* Max Thickness */}
-            <div>
-              <div className="flex justify-between text-xs text-slate-300 mb-1">
-                <span>Espesor Máximo (t_max)</span>
-                <span className="font-mono text-amber-400">{onParameterChange.t_max_mid.toFixed(1)} mm</span>
-              </div>
-              <input
-                type="range"
-                min="2.0"
-                max="20.0"
-                step="0.5"
-                value={onParameterChange.t_max_mid}
-                onChange={(e) => onParameterChange.set_t_max_mid(parseFloat(e.target.value))}
-                className="w-full accent-amber-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
-              />
-            </div>
-
-            {/* Incidence / Deviation */}
-            <div className="grid grid-cols-2 gap-2 pt-1">
-              <div>
-                <label className="text-[10px] text-slate-400 block mb-1">Incidencia (i):</label>
-                <input
-                  type="number"
-                  step="0.5"
-                  value={onParameterChange.incidence_deg}
-                  onChange={(e) => onParameterChange.set_incidence_deg(parseFloat(e.target.value) || 0)}
-                  className="w-full bg-[#080d1a] border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="text-[10px] text-slate-400 block mb-1">Desviación (δ):</label>
-                <input
-                  type="number"
-                  step="0.5"
-                  value={onParameterChange.deviation_deg}
-                  onChange={(e) => onParameterChange.set_deviation_deg(parseFloat(e.target.value) || 0)}
-                  className="w-full bg-[#080d1a] border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
-                />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Detailed Radial Table Hub / Mid / Tip */}
-        <div className={`bg-[#0f172a] p-4 rounded-lg border border-slate-800 ${onParameterChange ? 'lg:col-span-2' : 'lg:col-span-3'} overflow-x-auto`}>
-          <div className="flex items-center justify-between mb-3">
-            <h4 className="text-xs font-semibold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
-              <Info className="w-3.5 h-3.5 text-cyan-400" />
-              Variación Radial de Parámetros (Ley de Vórtice Libre)
-            </h4>
-            <span className="text-[11px] font-mono text-slate-400">
-              Altura de álabe $h_b$ = <strong>{hb_mm.toFixed(1)} mm</strong>
+          <div className="absolute bottom-3 left-3 rounded-md bg-surface/90 border border-line px-2.5 py-1 text-caption text-ink-3 flex items-center gap-3 pointer-events-none">
+            <span className="font-mono">
+              x <span ref={hudXRef} className="text-ink">—</span> · y <span ref={hudYRef} className="text-ink">—</span> mm
             </span>
+            <span className="tabular-nums">{view.zoom.toFixed(2)}×</span>
+            {gridVisible && <span className="hidden @3xl:inline tabular-nums">rejilla {gridStep} mm</span>}
           </div>
+        </div>
 
-          <table className="w-full text-left font-mono text-xs border-collapse">
+        <div className="flex flex-col gap-3 px-4 py-3 border-t border-line @3xl:border-0 @3xl:p-0">
+          <ul aria-label="Secciones radiales" className="flex flex-wrap gap-x-4 gap-y-1 text-caption text-ink-2 @3xl:absolute @3xl:top-3 @3xl:left-3 @3xl:flex-col @3xl:gap-1 @3xl:rounded-lg @3xl:bg-surface/90 @3xl:border @3xl:border-line @3xl:px-3 @3xl:py-2 @3xl:shadow-card">
+            <li className="hidden @3xl:block font-semibold text-ink">Secciones (vórtice libre)</li>
+            {visibleProfiles.map(({ profile, section }) => (
+              <li key={section} className="flex items-center gap-2 tabular-nums">
+                <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: SECTION_TOKEN[section] }} aria-hidden="true" />
+                {SECTION_LABEL[section]} · r/Rm = {profile.params.r_ratio.toFixed(2)} · {(profile.params.radius * 1000).toFixed(0)} mm
+              </li>
+            ))}
+          </ul>
+
+          <details
+            open={layersOpen}
+            onToggle={(event) => setLayersOpen(event.currentTarget.open)}
+            className="text-label text-ink-2 @3xl:absolute @3xl:top-3 @3xl:right-3 @3xl:max-w-[230px] @3xl:rounded-lg @3xl:bg-surface/90 @3xl:border @3xl:border-line @3xl:px-3 @3xl:py-2 @3xl:shadow-card"
+          >
+            <summary className="cursor-pointer select-none font-semibold text-ink flex items-center gap-1.5">
+              <Eye className="w-3.5 h-3.5 text-accent" aria-hidden="true" />
+              Capas
+            </summary>
+            <div className="mt-2 space-y-1.5">
+              {layerToggles.map((toggle) => (
+                <label key={toggle.label} className="flex items-start gap-2 cursor-pointer">
+                  <input type="checkbox" className="mt-0.5 accent-accent" checked={toggle.checked} onChange={(event) => toggle.onChange(event.target.checked)} />
+                  <span>
+                    {toggle.label}
+                    {toggle.hint && toggle.checked && <span className="block text-caption text-ink-3">{toggle.hint}</span>}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </details>
+
+          <dl className="grid grid-cols-2 @md:grid-cols-4 gap-2 @3xl:absolute @3xl:bottom-3 @3xl:right-3 @3xl:flex @3xl:items-center @3xl:gap-3 @3xl:rounded-md @3xl:bg-ok-soft @3xl:border @3xl:border-emerald-200 @3xl:px-3 @3xl:py-1.5">
+            {metrics.map((metric) => (
+              <div key={metric.label} className="rounded-md bg-ok-soft px-2.5 py-1.5 @3xl:bg-transparent @3xl:p-0 flex flex-col @3xl:flex-row @3xl:items-baseline @3xl:gap-1.5">
+                <dt className="text-caption text-ok">{metric.label}</dt>
+                <dd className="text-label font-semibold text-ink tabular-nums">{metric.value}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      </div>
+
+      <div className="p-4 sm:p-5 border-t border-line">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <h4 className="text-label font-semibold text-ink-2 flex items-center gap-1.5">
+            <Info className="w-3.5 h-3.5 text-accent" aria-hidden="true" />
+            Variación radial de parámetros (vórtice libre)
+          </h4>
+          <span className="text-label text-ink-3">
+            Altura de álabe h<sub>b</sub> = <strong className="font-semibold text-ink tabular-nums">{hb_mm.toFixed(1)} mm</strong>
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-left text-label tabular-nums border-collapse">
+            <caption className="sr-only">Parámetros del perfil en buje, sección media y punta</caption>
             <thead>
-              <tr className="border-b border-slate-800 text-[11px] text-slate-400">
-                <th className="py-1.5 px-2">Sección</th>
-                <th className="py-1.5 px-2">Radio [mm]</th>
-                <th className="py-1.5 px-2">β_flow,1 [°]</th>
-                <th className="py-1.5 px-2">β_flow,2 [°]</th>
-                <th className="py-1.5 px-2">β_metal,1 [°]</th>
-                <th className="py-1.5 px-2">β_metal,2 [°]</th>
-                <th className="py-1.5 px-2">Calado γ [°]</th>
-                <th className="py-1.5 px-2">c_ax [mm]</th>
-                <th className="py-1.5 px-2">t_max [mm]</th>
-                <th className="py-1.5 px-2">Paso s [mm]</th>
-                <th className="py-1.5 px-2">Exportar</th>
+              <tr className="border-b border-line text-caption text-ink-3">
+                <th scope="col" className="py-1.5 px-2 font-medium">Sección</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">Radio [mm]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">β flujo 1 [°]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">β flujo 2 [°]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">β metal 1 [°]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">β metal 2 [°]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">Calado γ [°]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">c<sub>ax</sub> [mm]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">t<sub>max</sub> [mm]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">Paso s [mm]</th>
+                <th scope="col" className="py-1.5 px-2 font-medium">Copiar</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800/60 text-slate-300">
-              {[hub, mid, tip].map((sec) => (
-                <tr key={sec.params.sectionName} className="hover:bg-slate-800/40 transition-colors">
-                  <td className="py-2 px-2 font-semibold flex items-center gap-1.5">
-                    <span
-                      className="w-2.5 h-2.5 rounded-full"
-                      style={{
-                        backgroundColor:
-                          sec.params.sectionName === 'Hub'
-                            ? '#06b6d4'
-                            : sec.params.sectionName === 'Mid'
-                            ? '#10b981'
-                            : '#f59e0b',
-                      }}
-                    />
-                    {sec.params.sectionName}
-                  </td>
-                  <td className="py-2 px-2">{(sec.params.radius * 1000).toFixed(1)}</td>
-                  <td className="py-2 px-2 text-cyan-400">{sec.params.beta_flow_1.toFixed(1)}°</td>
-                  <td className="py-2 px-2 text-cyan-400">{sec.params.beta_flow_2.toFixed(1)}°</td>
-                  <td className="py-2 px-2 text-emerald-400">{sec.params.beta_metal_1.toFixed(1)}°</td>
-                  <td className="py-2 px-2 text-emerald-400">{sec.params.beta_metal_2.toFixed(1)}°</td>
-                  <td className="py-2 px-2 text-amber-400">{sec.params.stagger_deg.toFixed(1)}°</td>
-                  <td className="py-2 px-2">{sec.params.c_ax.toFixed(1)}</td>
-                  <td className="py-2 px-2">{sec.params.t_max.toFixed(1)}</td>
-                  <td className="py-2 px-2">{sec.params.pitch_s.toFixed(1)}</td>
-                  <td className="py-2 px-2">
-                    <button
-                      onClick={() => handleCopyProfilePoints(sec)}
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors"
-                      title="Copiar puntos (x, y) de la sección"
-                    >
-                      {copiedSection === sec.params.sectionName ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-400" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+            <tbody className="divide-y divide-line text-ink-2">
+              {[hub, mid, tip].map((sec) => {
+                const name = sec.params.sectionName;
+                const copied = copyState?.section === name ? copyState : null;
+                return (
+                  <tr key={name} className="hover:bg-surface-muted transition-colors">
+                    <th scope="row" className="py-2 px-2 font-semibold text-ink">
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: SECTION_TOKEN[name] }} aria-hidden="true" />
+                        {SECTION_LABEL[name]}
+                      </span>
+                    </th>
+                    <td className="py-2 px-2">{(sec.params.radius * 1000).toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.beta_flow_1.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.beta_flow_2.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.beta_metal_1.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.beta_metal_2.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.stagger_deg.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.c_ax.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.t_max.toFixed(1)}</td>
+                    <td className="py-2 px-2">{sec.params.pitch_s.toFixed(1)}</td>
+                    <td className="py-2 px-2">
+                      <button
+                        type="button"
+                        onClick={() => handleCopyProfilePoints(sec)}
+                        aria-label={`Copiar los puntos (x, y) de la sección ${SECTION_LABEL[name].toLowerCase()} en JSON`}
+                        title={copied ? (copied.ok ? 'Copiado' : 'No se pudo copiar') : 'Copiar los puntos (x, y) en JSON'}
+                        className="p-1 rounded-md border border-line bg-surface text-ink-2 hover:bg-surface-sunken focus-visible:outline-2 focus-visible:outline-accent"
+                      >
+                        {copied?.ok ? <Check className="w-3.5 h-3.5 text-ok" aria-hidden="true" /> : <Copy className={`w-3.5 h-3.5 ${copied && !copied.ok ? 'text-danger' : ''}`} aria-hidden="true" />}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
+        <p className="sr-only" aria-live="polite">
+          {copyState ? (copyState.ok ? 'Coordenadas copiadas al portapapeles' : 'No se pudieron copiar las coordenadas') : ''}
+        </p>
       </div>
     </div>
   );

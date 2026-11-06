@@ -12,10 +12,13 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/utils/turbine1D.test.ts src/utils/bladeGeometry.test.ts",
-    "check": "npm run typecheck && npm test && npm run build"
+    "test": "tsx --test src/utils/turbine1D.test.ts src/utils/bladeGeometry.test.ts src/utils/customEquations.test.ts src/utils/exportGeometry.test.ts src/utils/designOptimization.test.ts src/utils/designState.test.ts",
+    "lint:theme": "node scripts/check-theme.mjs",
+    "check": "npm run typecheck && npm test && npm run lint:theme && npm run build"
   },
   "dependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@fontsource-variable/plus-jakarta-sans": "^5.3.0",
     "lucide-react": "^0.546.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",

@@ -1,1449 +1,2060 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import React, { useState, useMemo } from 'react';
 import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ComponentType,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Code2,
+  Compass,
+  Download,
+  FileCode,
+  Flame,
+  Folder,
+  FolderOpen,
+  Gauge,
+  Info,
+  Plus,
+  RotateCcw,
+  Save,
+  Search,
+  ShieldCheck,
+  Sigma,
+  Sliders,
+  Sparkles,
+  Trash2,
+  Undo2,
+  Upload,
+  Wind,
+  X,
+} from 'lucide-react';
+import Modal from './ui/Modal';
+import NumberField from './ui/NumberField';
+import {downloadBlob} from '../utils/download';
+import {
+  EQUATION_CATALOG,
+  EQUATION_TEMPLATES,
+  SAFE_DEFAULT_EQUATIONS,
+  checkIfModified,
+  normalizeCustomEquations,
+  normalizeCustomEquationsReport,
+  safeEvaluateMath,
   type CustomEquationsConfig,
   type EquationEvaluationContext,
   type EquationNode,
-  SAFE_DEFAULT_EQUATIONS,
-  EQUATION_TEMPLATES,
-  EQUATION_CATALOG,
-  checkIfModified,
-  evaluateCustomSoderberg,
-  evaluateCustomBladeHeight,
-  safeEvaluateMath,
-  normalizeCustomEquations,
 } from '../utils/customEquations';
-import {
-  X,
-  RotateCcw,
-  Sliders,
-  CheckCircle2,
-  AlertTriangle,
-  Code2,
-  Sparkles,
-  Download,
-  Upload,
-  Info,
-  ChevronRight,
-  ChevronDown,
-  Folder,
-  FolderOpen,
-  FileCode,
-  ShieldCheck,
-  Cpu,
-  Layers,
-  Wind,
-  Search,
-  BookOpen,
-  Compass,
-  Gauge,
-  Flame,
-  Sigma,
-  ChevronsUpDown,
-  Save,
-  Trash2,
-} from 'lucide-react';
+
+// ---------------------------------------------------------------------------
+// Tipos y constantes
+// ---------------------------------------------------------------------------
+
+type Config = CustomEquationsConfig;
+type CategoryId = EquationNode['category'];
+type EditableType = NonNullable<EquationNode['editableType']>;
+type ResettableType = Exclude<EditableType, 'sandbox'>;
+type UserEquation = Config['userEquations'][number];
+type Scope = Record<string, number>;
+
+/** Subsecciones de la configuración cuyo valor es un objeto de parámetros. */
+type SectionKey =
+  | 'soderberg'
+  | 'ainleyMathieson'
+  | 'sizing'
+  | 'zweifel'
+  | 'thermodynamics'
+  | 'kinematics'
+  | 'geometry'
+  | 'userDefinedLoss';
+
+type NumericKeys<T> = {[P in keyof T]-?: T[P] extends number ? P : never}[keyof T];
+type StringKeys<T> = {[P in keyof T]-?: T[P] extends string ? P : never}[keyof T];
 
 interface SavedEquationProfile {
   id: string;
   name: string;
-  config: CustomEquationsConfig;
+  config: Config;
 }
 
-const PROFILES_STORAGE_KEY = 'axial-turbine.equation-profiles.v1';
+interface UndoState {
+  message: string;
+  previousConfig: Config;
+  previousDraft: Config;
+}
 
-const getExpressionError = (expression: string, scope: Record<string, number>, fallback: number) =>
-  expression.trim() ? safeEvaluateMath(expression, scope, fallback).error : 'La expresión está vacía.';
+interface Notice {
+  tone: 'ok' | 'warn' | 'danger';
+  text: string;
+}
 
 interface EquationEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
+  /** Configuración aplicada al cálculo. */
   config: CustomEquationsConfig;
+  /** Aplica (y persiste) una configuración nueva. Solo se llama al pulsar «Aplicar», al restablecer o al deshacer. */
   onSaveConfig: (newConfig: CustomEquationsConfig) => void;
-  evalContext: EquationEvaluationContext;
+  /** Valores de la etapa activa para la vista previa; null si todavía no hay un diseño calculado. */
+  evalContext: EquationEvaluationContext | null;
   currentStageName: string;
 }
 
-export const EquationEditorModal: React.FC<EquationEditorModalProps> = ({
+const PROFILES_STORAGE_KEY = 'axial-turbine.equation-profiles.v1';
+const MAX_IMPORT_BYTES = 256 * 1024;
+const UNDO_WINDOW_MS = 6000;
+const PREVIEW_DEBOUNCE_MS = 300;
+
+const SECTION_BY_TYPE: Record<ResettableType, SectionKey> = {
+  soderberg: 'soderberg',
+  ainley: 'ainleyMathieson',
+  sizing: 'sizing',
+  zweifel: 'zweifel',
+  thermo: 'thermodynamics',
+  kinematics: 'kinematics',
+  geometry: 'geometry',
+  user_loss: 'userDefinedLoss',
+};
+
+interface CategoryMeta {
+  id: CategoryId;
+  name: string;
+  icon: ComponentType<{className?: string}>;
+}
+
+const CATEGORIES: CategoryMeta[] = [
+  {id: 'thermodynamics', name: 'Termodinámica y expansión', icon: Flame},
+  {id: 'kinematics', name: 'Cinemática y triángulos de velocidades', icon: Wind},
+  {id: 'geometry', name: 'Geometría y canal meridional', icon: Compass},
+  {id: 'losses', name: 'Modelos de pérdidas', icon: Gauge},
+  {id: 'sandbox', name: 'Fórmulas libres y pruebas', icon: Code2},
+];
+
+const CATEGORY_NAME: Record<CategoryId, string> = Object.fromEntries(
+  CATEGORIES.map((category) => [category.id, category.name]),
+) as Record<CategoryId, string>;
+
+// Valores de prueba para validar las expresiones mientras se escriben. Cada ámbito replica las
+// variables que el solver pasa a esa expresión (turbine1D / customEquations), así que sus claves son
+// también la lista de variables que se muestra al usuario. Ángulos en radianes.
+// Soderberg: row vale 0 en el estator y 1 en el rotor; tc es t/c.
+const SODERBERG_TEST_SCOPE: Scope = {eps: 35, AR: 2.2, row: 1, tc: 0.2};
+
+type AinleyExpressionKey = 'customYpExpression' | 'customYpStatorExpression' | 'customYsExpression' | 'customYtcExpression';
+
+const AINLEY_TEST_SCOPES: Record<AinleyExpressionKey, Scope> = {
+  // Perfil del rotor.
+  customYpExpression: {
+    Yp_base: 0.08,
+    Yp_nozzle: 0.05,
+    Yp_impulse: 0.1,
+    xi: 0.5,
+    xi_signed: 0.5,
+    t_over_c: 0.2,
+    s_over_c: 0.8,
+    beta1: 0.25,
+    beta2: -0.9,
+    AR: 2,
+    nozzleA: 0.025,
+    nozzleB: 0.065,
+    impulseA: 0.075,
+    impulseB: 0.165,
+  },
+  // Perfil del estator.
+  customYpStatorExpression: {
+    Yp_base: 0.05,
+    Yp_nozzle: 0.046,
+    Yp_impulse: 0.12,
+    xi: 0.2,
+    xi_signed: 0.2,
+    nozzleA: 0.025,
+    nozzleB: 0.065,
+    impulseA: 0.075,
+    impulseB: 0.165,
+    abs_alpha1: 60,
+    alpha0: -0.2,
+    alpha1: 1.05,
+    s_over_c: 0.8,
+    t_over_c: 0.2,
+    AR: 2,
+  },
+  // Se evalúa en las dos filas: solo variables comunes (en el estator b1 = α0, b2 = α1, bm = α_m).
+  customYsExpression: {secondaryCoeff: 0.033, AR: 2, lambda: 0.0165, CL_sc: 0.8, b1: 0.25, b2: -0.9, bm: -0.35},
+  // Holgura de punta del rotor.
+  customYtcExpression: {
+    B_tip: 0.5,
+    tipClearanceRatio: 0.015,
+    secondaryCoeff: 0.033,
+    AR: 2,
+    CL_sc: 0.8,
+    beta1: 0.25,
+    beta2: -0.9,
+    beta_m: -0.35,
+    b1: 0.25,
+    b2: -0.9,
+    bm: -0.35,
+  },
+};
+
+const SIZING_TEST_SCOPE: Scope = {Area: 0.005, Area_ideal: 0.005, effectiveArea: 0.005, blockage: 0.02, Rm: 0.1};
+
+const ZWEIFEL_TEST_SCOPE: Scope = {s: 25, c_ax: 38, b1_rad: 0.3, b2_rad: 0.5, b1: 0.3, b2: 0.5, psi_Z: 0.85};
+
+const YS_PLACEHOLDER =
+  '(secondaryCoeff / AR) * Math.pow(CL_sc, 2) * (Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3)) * (Math.cos(b2) / Math.cos(b1))';
+
+const DEFAULT_SANDBOX_EXPRESSION = '0.04 + 0.06 * Math.pow(eps / 100, 2) * (0.975 + 0.075 / AR)';
+
+// ---------------------------------------------------------------------------
+// Utilidades puras
+// ---------------------------------------------------------------------------
+
+const cloneConfig = (config: Config): Config => structuredClone(config);
+
+const sameConfig = (a: Config, b: Config): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+const sameSection = <K extends keyof Config>(config: Config, key: K): boolean =>
+  JSON.stringify(config[key]) === JSON.stringify(SAFE_DEFAULT_EQUATIONS[key]);
+
+function patchSection<K extends SectionKey>(config: Config, key: K, patch: Partial<Config[K]>): Config {
+  const next = {...config};
+  next[key] = {...config[key], ...patch};
+  return next;
+}
+
+function resetSection(config: Config, type: ResettableType): Config {
+  const key = SECTION_BY_TYPE[type];
+  const next = patchSection(config, key, structuredClone(SAFE_DEFAULT_EQUATIONS[key]));
+  return {...next, isModified: checkIfModified(next)};
+}
+
+const SODERBERG_NUMERIC_KEYS = (Object.keys(SAFE_DEFAULT_EQUATIONS.soderberg) as (keyof Config['soderberg'])[]).filter(
+  (key) => typeof SAFE_DEFAULT_EQUATIONS.soderberg[key] === 'number',
+);
+
+/** Misma condición que usa el solver para decidir si Soderberg sale de la correlación de referencia. */
+function isSoderbergCustom(soderberg: Config['soderberg']): boolean {
+  if (!soderberg.enabled) return false;
+  if (soderberg.useCustomFormula) return true;
+  return SODERBERG_NUMERIC_KEYS.some((key) => soderberg[key] !== SAFE_DEFAULT_EQUATIONS.soderberg[key]);
+}
+
+function isCategoryModified(config: Config, category: CategoryId): boolean {
+  switch (category) {
+    case 'thermodynamics':
+      return !sameSection(config, 'thermodynamics');
+    case 'kinematics':
+      return !sameSection(config, 'kinematics');
+    case 'geometry':
+      return !sameSection(config, 'sizing') || !sameSection(config, 'zweifel') || !sameSection(config, 'geometry');
+    case 'losses':
+      return (
+        isSoderbergCustom(config.soderberg) ||
+        !sameSection(config, 'ainleyMathieson') ||
+        !sameSection(config, 'userDefinedLoss')
+      );
+    case 'sandbox':
+      return config.userEquations.length > 0;
+  }
+}
+
+function getExpressionError(expression: unknown, scope: Scope, fallback: number): string | null {
+  if (typeof expression !== 'string') return 'La expresión no es texto.';
+  if (!expression.trim()) return 'La expresión está vacía.';
+  return safeEvaluateMath(expression, scope, fallback).error;
+}
+
+function formatDefault(value: unknown): string {
+  return typeof value === 'number' && Number.isFinite(value) ? String(Number(value.toPrecision(6))) : '—';
+}
+
+function variableList(scope: Scope): string {
+  return Object.keys(scope).join(', ');
+}
+
+function buildBasicScope(ctx: EquationEvaluationContext): Scope {
+  return {
+    eps: ctx.eps_deg,
+    AR: ctx.aspectRatio,
+    turning: ctx.eps_deg,
+    Rm: ctx.Rm_m,
+    U: ctx.U_ms,
+    Va: ctx.Va_ms,
+    PR: ctx.PR,
+    m_dot: ctx.m_dot,
+  };
+}
+
+function buildUserEquationScope(ctx: EquationEvaluationContext): Scope {
+  return {
+    ...buildBasicScope(ctx),
+    phi: ctx.flowCoeff_phi,
+    beta1: ctx.beta1_deg,
+    beta2: ctx.beta2_deg,
+    Mach: ctx.Mach_abs1,
+    MachRel: ctx.Mach_rel1,
+    dh_is_kJkg: ctx.dh0_kJkg,
+    eta_tt: ctx.eta_tt,
+  };
+}
+
+const USER_LOSS_VARIABLES = [
+  'dh_is', 'dh_actual', 'dh_loss_stator', 'dh_loss_rotor', 'dh_loss_soderberg', 'dh_loss_ainley',
+  'Mach', 'MachRel', 'MachRel2', 'U', 'Va', 'V1', 'W1', 'V2', 'W2', 'AR', 'eps', 'phi', 'psi', 'PR',
+  'm_dot', 'P01', 'T01', 'gamma', 'zeta_N', 'zeta_R', 'Yp_rotor', 'Ys_rotor', 'Ytc_rotor',
+] as const;
+
+function buildUserLossScope(ctx: EquationEvaluationContext): Scope {
+  return {
+    dh_is: ctx.dh_is_Jkg,
+    dh_actual: ctx.dh0_kJkg * 1000,
+    dh_loss_stator: ctx.dh_loss_stator_Jkg,
+    dh_loss_rotor: ctx.dh_loss_rotor_Jkg,
+    dh_loss_soderberg: ctx.dh_loss_soderberg_Jkg,
+    dh_loss_ainley: ctx.dh_loss_ainley_Jkg,
+    Mach: ctx.Mach_abs1,
+    MachRel: ctx.Mach_rel1,
+    MachRel2: ctx.Mach_rel2,
+    U: ctx.U_ms,
+    Va: ctx.Va_ms,
+    V1: ctx.V1_ms,
+    W1: ctx.W1_ms,
+    V2: ctx.V2_ms,
+    W2: ctx.W2_ms,
+    AR: ctx.aspectRatio,
+    eps: ctx.eps_deg,
+    phi: ctx.flowCoeff_phi,
+    psi: ctx.stageLoading_psi,
+    PR: ctx.PR,
+    m_dot: ctx.m_dot,
+    P01: ctx.P01_bar * 1e5,
+    T01: ctx.T01_K,
+    gamma: ctx.gamma,
+    zeta_N: ctx.zeta_N,
+    zeta_R: ctx.zeta_R,
+    Yp_rotor: ctx.Yp_rotor,
+    Ys_rotor: ctx.Ys_rotor,
+    Ytc_rotor: ctx.Ytc_rotor,
+  };
+}
+
+/** Valores de muestra (todos distintos y no nulos) para validar la sintaxis cuando aún no hay diseño. */
+const USER_LOSS_SAMPLE_SCOPE: Scope = Object.fromEntries(
+  USER_LOSS_VARIABLES.map((name, index) => [name, 1 + 0.137 * (index + 1)]),
+);
+
+function isStoredProfile(value: unknown): value is {id: string; name: string; config: unknown} {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === 'string' && typeof record.name === 'string' && !!record.config && typeof record.config === 'object';
+}
+
+function loadSavedProfiles(): SavedEquationProfile[] {
+  try {
+    const stored = localStorage.getItem(PROFILES_STORAGE_KEY);
+    const parsed: unknown = stored ? JSON.parse(stored) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(isStoredProfile)
+      .map((profile) => ({id: profile.id, name: profile.name, config: normalizeCustomEquations(profile.config)}));
+  } catch {
+    return [];
+  }
+}
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [value, delayMs]);
+  return debounced;
+}
+
+// ---------------------------------------------------------------------------
+// Controles reutilizables
+// ---------------------------------------------------------------------------
+
+const TEXTAREA_CLASS =
+  'w-full rounded-lg border border-line-strong bg-surface px-2.5 py-2 font-mono text-base text-ink placeholder:text-ink-3 sm:text-sm focus-visible:outline-2 focus-visible:outline-offset-0 focus-visible:outline-accent';
+
+interface ExpressionFieldProps {
+  label: ReactNode;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  /** undefined: sin validación visible; null: válida; string: mensaje de error. */
+  error?: string | null;
+  hint?: ReactNode;
+  multiline?: boolean;
+  rows?: number;
+  className?: string;
+}
+
+function ExpressionField({label, value, onChange, placeholder, error, hint, multiline = false, rows = 2, className = ''}: ExpressionFieldProps) {
+  const id = useId();
+  const hintId = `${id}-hint`;
+  const messageId = `${id}-message`;
+  const describedBy = [hint ? hintId : null, error !== undefined ? messageId : null].filter(Boolean).join(' ') || undefined;
+  const invalid = typeof error === 'string';
+  const invalidRing = invalid ? 'ring-2 ring-rose-300' : '';
+
+  return (
+    <div className={`flex min-w-0 flex-col gap-1.5 ${className}`}>
+      <label htmlFor={id} className="text-label font-medium text-ink-2">
+        {label}
+      </label>
+      {multiline ? (
+        <textarea
+          id={id}
+          rows={rows}
+          value={value}
+          placeholder={placeholder}
+          spellCheck={false}
+          aria-invalid={invalid || undefined}
+          aria-describedby={describedBy}
+          onChange={(event) => onChange(event.target.value)}
+          className={`${TEXTAREA_CLASS} ${invalidRing}`}
+        />
+      ) : (
+        <input
+          id={id}
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          spellCheck={false}
+          autoComplete="off"
+          aria-invalid={invalid || undefined}
+          aria-describedby={describedBy}
+          onChange={(event) => onChange(event.target.value)}
+          className={`field w-full font-mono max-sm:h-10 max-sm:text-base ${invalidRing}`}
+        />
+      )}
+      {hint && (
+        <div id={hintId} className="text-caption text-ink-3">
+          {hint}
+        </div>
+      )}
+      {error !== undefined && (
+        <p id={messageId} className={`text-caption ${invalid ? 'text-danger' : 'text-ok'}`}>
+          {invalid ? `Expresión no válida: ${error}` : 'Expresión válida.'}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function Toggle({checked, onChange, children}: {checked: boolean; onChange: (checked: boolean) => void; children: ReactNode}) {
+  return (
+    <label className="flex min-h-10 cursor-pointer items-center gap-2.5 text-body font-medium text-ink-2">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        className="h-4 w-4 shrink-0 cursor-pointer accent-accent"
+      />
+      <span>{children}</span>
+    </label>
+  );
+}
+
+function VariableHint({scope, note}: {scope: Scope; note?: ReactNode}) {
+  return (
+    <p className="text-caption leading-relaxed text-ink-3">
+      Admite aritmética y funciones <code className="font-mono text-ink-2">Math.*</code>. Variables:{' '}
+      <code className="font-mono text-ink-2">{variableList(scope)}</code>.{note ? <> {note}</> : null}
+    </p>
+  );
+}
+
+interface ParamSpec<K extends SectionKey> {
+  key: NumericKeys<Config[K]>;
+  label: string;
+  symbol?: string;
+  unit?: string;
+  hint?: string;
+  min?: number;
+  max?: number;
+  step: number;
+}
+
+interface SectionNumberFieldsProps<K extends SectionKey> {
+  section: K;
+  specs: ParamSpec<K>[];
+  draft: Config;
+  onPatch: (section: K, patch: Partial<Config[K]>) => void;
+  className?: string;
+}
+
+function SectionNumberFields<K extends SectionKey>({section, specs, draft, onPatch, className = ''}: SectionNumberFieldsProps<K>) {
+  return (
+    <div className={`grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 ${className}`}>
+      {specs.map((spec) => {
+        const raw: unknown = draft[section][spec.key];
+        const value = typeof raw === 'number' ? raw : Number.NaN;
+        const defaultValue: unknown = SAFE_DEFAULT_EQUATIONS[section][spec.key];
+        return (
+          <NumberField
+            key={String(spec.key)}
+            label={spec.label}
+            symbol={spec.symbol}
+            unit={spec.unit}
+            value={value}
+            min={spec.min}
+            max={spec.max}
+            step={spec.step}
+            hint={spec.hint}
+            typical={`${formatDefault(defaultValue)} (por defecto)`}
+            onChange={(next) => onPatch(section, {[spec.key]: next} as Partial<Config[K]>)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Especificación de los parámetros numéricos
+// ---------------------------------------------------------------------------
+
+const SODERBERG_ZETA_SPECS: ParamSpec<'soderberg'>[] = [
+  {key: 'a', label: 'Constante base', symbol: 'a', hint: 'Pérdida con deflexión nula.', min: 0, max: 0.2, step: 0.005},
+  {key: 'b', label: 'Sensibilidad a la deflexión', symbol: 'b', hint: 'Peso del término (ε/100)^c.', min: 0, max: 0.3, step: 0.005},
+  {key: 'c', label: 'Exponente de deflexión', symbol: 'c', hint: 'Forma de la curva frente a ε.', min: 0.5, max: 4, step: 0.1},
+  {
+    key: 'tk',
+    label: 'Corrección por espesor',
+    symbol: 't_k',
+    hint: 'Se resta t_k·(t/c)/0,20. Con 0 no hay corrección.',
+    min: 0,
+    max: 0.05,
+    step: 0.001,
+  },
+];
+
+const SODERBERG_ROTOR_SPECS: ParamSpec<'soderberg'>[] = [
+  {key: 'd', label: 'Intercepto', symbol: 'd', hint: 'Término independiente de AR.', min: 0.5, max: 1.5, step: 0.005},
+  {key: 'e', label: 'Pendiente', symbol: 'e', hint: 'Penalización proporcional a 1/AR.', min: 0, max: 0.5, step: 0.005},
+];
+
+const SODERBERG_STATOR_SPECS: ParamSpec<'soderberg'>[] = [
+  {key: 'dStator', label: 'Intercepto', symbol: 'd', hint: 'Término independiente de AR.', min: 0.5, max: 1.5, step: 0.005},
+  {key: 'eStator', label: 'Pendiente', symbol: 'e', hint: 'Penalización proporcional a 1/AR.', min: 0, max: 0.5, step: 0.005},
+];
+
+const AINLEY_SPECS: ParamSpec<'ainleyMathieson'>[] = [
+  {key: 'nozzleA', label: 'Tobera: constante', symbol: 'A_N', hint: 'Perfil de tobera pura (α₁ = 0).', min: 0, max: 0.1, step: 0.005},
+  {key: 'nozzleB', label: 'Tobera: pendiente', symbol: 'B_N', hint: 'Crecimiento con el ángulo de salida.', min: 0, max: 0.3, step: 0.005},
+  {key: 'impulseA', label: 'Impulso: constante', symbol: 'A_I', hint: 'Perfil de impulso puro (R = 0).', min: 0, max: 0.2, step: 0.005},
+  {key: 'impulseB', label: 'Impulso: pendiente', symbol: 'B_I', hint: 'Crecimiento con el ángulo de salida.', min: 0, max: 0.4, step: 0.005},
+  {key: 'secondaryCoeff', label: 'Coeficiente secundario', symbol: 'λ', hint: 'Pérdida secundaria ∝ λ/AR.', min: 0, max: 0.08, step: 0.001},
+  {
+    key: 'tipClearanceCoeff',
+    label: 'Coeficiente de holgura de punta',
+    symbol: 'B_tip',
+    hint: '0,50 sin banda; 0,25 con banda; 0 anula la pérdida por holgura.',
+    min: 0,
+    max: 0.8,
+    step: 0.05,
+  },
+];
+
+const SIZING_SPECS: ParamSpec<'sizing'>[] = [
+  {
+    key: 'aspectRatioTarget',
+    label: 'Relación de aspecto para la cuerda automática',
+    symbol: 'h/c',
+    hint: 'Se usa cuando no se indica una cuerda axial en Geometría.',
+    min: 0.5,
+    max: 8,
+    step: 0.1,
+  },
+];
+
+const ZWEIFEL_SPECS: ParamSpec<'zweifel'>[] = [
+  {key: 'multiplier', label: 'Multiplicador de la ecuación', hint: 'Valor clásico de Zweifel: 2.', min: 0.1, max: 10, step: 0.1},
+];
+
+const THERMO_SPECS: ParamSpec<'thermodynamics'>[] = [
+  {
+    key: 'reheatFactorPerStage',
+    label: 'Factor de recalentamiento por etapa',
+    symbol: 'α_rh',
+    hint: 'Compensa la divergencia de las isobaras en varias etapas. 0 lo desactiva.',
+    min: 0,
+    max: 0.05,
+    step: 0.001,
+  },
+  {
+    key: 'kineticEnergyCarryOverFraction',
+    label: 'Recuperación cinética entre etapas',
+    hint: 'Fracción de la energía cinética de salida aprovechada por la tobera siguiente.',
+    min: 0,
+    max: 0.8,
+    step: 0.05,
+  },
+];
+
+const KINEMATICS_SPECS: ParamSpec<'kinematics'>[] = [
+  {
+    key: 'eulerWorkMultiplier',
+    label: 'Multiplicador del trabajo de Euler',
+    hint: 'Corrección del trabajo específico (1 = Euler ideal).',
+    min: 0.8,
+    max: 1.05,
+    step: 0.01,
+  },
+  {
+    key: 'deHallerMin',
+    label: 'Límite mínimo de De Haller',
+    symbol: 'W₂/W₁',
+    hint: 'Criterio clásico de desprendimiento: 0,72.',
+    min: 0.6,
+    max: 0.85,
+    step: 0.01,
+  },
+];
+
+const GEOMETRY_SPECS: ParamSpec<'geometry'>[] = [
+  {
+    key: 'freeVortexExponent',
+    label: 'Exponente de vórtice radial',
+    symbol: 'n',
+    hint: 'Ley Vθ · rⁿ = cte. 1 = vórtice libre; 0 = remolino constante.',
+    min: 0,
+    max: 1.5,
+    step: 0.1,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Árbol de ecuaciones accesible (patrón tree de WAI-ARIA)
+// ---------------------------------------------------------------------------
+
+interface CategoryGroup extends CategoryMeta {
+  nodes: EquationNode[];
+  subfolders: {title: string; nodes: EquationNode[]}[];
+}
+
+type TreeEntry = {kind: 'folder'; key: string; categoryId: CategoryId} | {kind: 'node'; key: string; categoryId: CategoryId; nodeId: string};
+
+interface EquationTreeProps {
+  groups: CategoryGroup[];
+  isExpanded: (id: CategoryId) => boolean;
+  onToggle: (id: CategoryId, expand?: boolean) => void;
+  selectedId: string;
+  onSelect: (id: string) => void;
+  modifiedCategories: ReadonlySet<CategoryId>;
+  labelledBy: string;
+}
+
+function EquationTree({groups, isExpanded, onToggle, selectedId, onSelect, modifiedCategories, labelledBy}: EquationTreeProps) {
+  const itemRefs = useRef(new Map<string, HTMLLIElement>());
+  const [focusedKey, setFocusedKey] = useState<string>(`node:${selectedId}`);
+
+  const entries = useMemo<TreeEntry[]>(() => {
+    const list: TreeEntry[] = [];
+    groups.forEach((group) => {
+      list.push({kind: 'folder', key: `folder:${group.id}`, categoryId: group.id});
+      if (isExpanded(group.id)) {
+        group.subfolders.forEach((subfolder) =>
+          subfolder.nodes.forEach((node) =>
+            list.push({kind: 'node', key: `node:${node.id}`, categoryId: group.id, nodeId: node.id}),
+          ),
+        );
+      }
+    });
+    return list;
+  }, [groups, isExpanded]);
+
+  const activeKey = entries.some((entry) => entry.key === focusedKey) ? focusedKey : entries[0]?.key;
+
+  const focusEntry = (key: string | undefined) => {
+    if (!key) return;
+    setFocusedKey(key);
+    itemRefs.current.get(key)?.focus();
+  };
+
+  const registerRef = (key: string) => (element: HTMLLIElement | null) => {
+    if (element) itemRefs.current.set(key, element);
+    else itemRefs.current.delete(key);
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
+    const index = entries.findIndex((entry) => entry.key === activeKey);
+    const current = entries[index];
+    if (!current) return;
+    let handled = true;
+    switch (event.key) {
+      case 'ArrowDown':
+        focusEntry(entries[Math.min(entries.length - 1, index + 1)]?.key);
+        break;
+      case 'ArrowUp':
+        focusEntry(entries[Math.max(0, index - 1)]?.key);
+        break;
+      case 'Home':
+        focusEntry(entries[0]?.key);
+        break;
+      case 'End':
+        focusEntry(entries[entries.length - 1]?.key);
+        break;
+      case 'ArrowRight':
+        if (current.kind === 'folder') {
+          if (!isExpanded(current.categoryId)) onToggle(current.categoryId, true);
+          else focusEntry(entries[index + 1]?.kind === 'node' ? entries[index + 1].key : undefined);
+        }
+        break;
+      case 'ArrowLeft':
+        if (current.kind === 'folder') {
+          if (isExpanded(current.categoryId)) onToggle(current.categoryId, false);
+        } else {
+          focusEntry(`folder:${current.categoryId}`);
+        }
+        break;
+      case 'Enter':
+      case ' ':
+        if (current.kind === 'folder') onToggle(current.categoryId);
+        else onSelect(current.nodeId);
+        break;
+      default:
+        handled = false;
+    }
+    if (handled) event.preventDefault();
+  };
+
+  return (
+    <ul role="tree" aria-labelledby={labelledBy} onKeyDown={handleKeyDown} className="space-y-1.5">
+      {groups.map((group) => {
+        const expanded = isExpanded(group.id);
+        const folderKey = `folder:${group.id}`;
+        const Icon = group.icon;
+        const FolderIcon = expanded ? FolderOpen : Folder;
+        const modified = modifiedCategories.has(group.id);
+        return (
+          <li
+            key={group.id}
+            ref={registerRef(folderKey)}
+            role="treeitem"
+            aria-expanded={expanded}
+            tabIndex={activeKey === folderKey ? 0 : -1}
+            onFocus={(event) => {
+              if (event.target === event.currentTarget) setFocusedKey(folderKey);
+            }}
+            className="group/folder rounded-lg border border-line bg-surface focus-visible:outline-none"
+          >
+            <div
+              onClick={() => {
+                setFocusedKey(folderKey);
+                onToggle(group.id);
+              }}
+              className="flex min-h-10 cursor-pointer items-center justify-between gap-2 rounded-lg px-2.5 py-2 hover:bg-surface-sunken group-focus-visible/folder:outline-2 group-focus-visible/folder:outline-offset-[-2px] group-focus-visible/folder:outline-accent-strong"
+            >
+              <span className="flex min-w-0 items-center gap-1.5">
+                {expanded ? (
+                  <ChevronDown className="h-4 w-4 shrink-0 text-ink-3" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-4 w-4 shrink-0 text-ink-3" aria-hidden="true" />
+                )}
+                <FolderIcon className="h-4 w-4 shrink-0 text-warn" aria-hidden="true" />
+                <Icon className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+                <span className="truncate text-label font-semibold text-ink">{group.name}</span>
+              </span>
+              <span className="flex shrink-0 items-center gap-1.5">
+                {modified && (
+                  <span className="flex items-center" title="Con cambios respecto a los valores de referencia">
+                    <span className="h-2 w-2 rounded-full bg-warn" aria-hidden="true" />
+                    <span className="sr-only">(con cambios)</span>
+                  </span>
+                )}
+                <span className="rounded bg-surface-sunken px-1.5 text-caption tabular-nums text-ink-3">
+                  {group.nodes.length}
+                </span>
+              </span>
+            </div>
+
+            {expanded && (
+              <ul role="group" className="space-y-0.5 border-t border-line bg-surface-muted py-1 pl-4 pr-1">
+                {group.subfolders.map((subfolder) => (
+                  <li key={subfolder.title} role="none">
+                    {group.subfolders.length > 1 && (
+                      <span className="block px-2 pb-0.5 pt-1.5 text-caption font-medium text-ink-3" aria-hidden="true">
+                        {subfolder.title}
+                      </span>
+                    )}
+                    <ul role="none" className="space-y-0.5">
+                      {subfolder.nodes.map((node) => {
+                        const nodeKey = `node:${node.id}`;
+                        const isSelected = node.id === selectedId;
+                        return (
+                          <li
+                            key={node.id}
+                            ref={registerRef(nodeKey)}
+                            role="treeitem"
+                            aria-selected={isSelected}
+                            tabIndex={activeKey === nodeKey ? 0 : -1}
+                            onFocus={() => setFocusedKey(nodeKey)}
+                            onClick={() => {
+                              setFocusedKey(nodeKey);
+                              onSelect(node.id);
+                            }}
+                            className={`flex min-h-9 cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent-strong ${
+                              isSelected
+                                ? 'bg-accent-soft font-semibold text-accent-strong ring-1 ring-cyan-300'
+                                : 'text-ink-2 hover:bg-surface-sunken hover:text-ink'
+                            }`}
+                          >
+                            <span className="flex min-w-0 items-center gap-1.5">
+                              <FileCode
+                                className={`h-3.5 w-3.5 shrink-0 ${isSelected ? 'text-accent-strong' : 'text-ink-3'}`}
+                                aria-hidden="true"
+                              />
+                              <span className="truncate text-label">{node.name}</span>
+                            </span>
+                            {node.editableType && (
+                              <span className="shrink-0 rounded bg-surface-sunken px-1.5 text-caption text-ink-3">editable</span>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Modal principal
+// ---------------------------------------------------------------------------
+
+export function EquationEditorModal({
   isOpen,
   onClose,
   config,
   onSaveConfig,
   evalContext,
   currentStageName,
-}) => {
-  // Active selected equation node from the tree
+}: EquationEditorModalProps) {
+  const ids = useId();
+  const treeLabelId = `${ids}-tree-label`;
+  const searchId = `${ids}-search`;
+  const mobileSelectId = `${ids}-mobile-select`;
+  const profileSelectId = `${ids}-profile-select`;
+  const profileNameId = `${ids}-profile-name`;
+  const userEquationSelectId = `${ids}-user-equation`;
+  const importInputRef = useRef<HTMLInputElement>(null);
+
   const [selectedEqId, setSelectedEqId] = useState<string>('thermo_state');
-  // Draft configuration
-  const [draft, setDraft] = useState<CustomEquationsConfig>({ ...config });
-  // Tree search query
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  // Expanded state for folders
-  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({
+  const [draft, setDraft] = useState<Config>(() => cloneConfig(config));
+  const [searchQuery, setSearchQuery] = useState('');
+  const [expandedFolders, setExpandedFolders] = useState<Record<CategoryId, boolean>>({
     thermodynamics: true,
     kinematics: true,
     geometry: true,
     losses: true,
     sandbox: true,
   });
-  // Sandbox custom test state
-  const [sandboxExpr, setSandboxExpr] = useState<string>('0.04 + 0.06 * Math.pow(eps / 100, 2) * (0.975 + 0.075 / AR)');
-  const [sandboxResult, setSandboxResult] = useState<{ value: number; error: string | null } | null>(null);
-  const [importError, setImportError] = useState<string | null>(null);
-  const [profileName, setProfileName] = useState<string>(config.name);
-  const [selectedProfileId, setSelectedProfileId] = useState<string>('');
-  const [savedProfiles, setSavedProfiles] = useState<SavedEquationProfile[]>(() => {
-    try {
-      const stored = localStorage.getItem(PROFILES_STORAGE_KEY);
-      const parsed = stored ? JSON.parse(stored) : [];
-      return Array.isArray(parsed) ? parsed
-        .filter((profile) => profile && typeof profile.id === 'string' && typeof profile.name === 'string' && profile.config)
-        .map((profile) => ({ ...profile, config: normalizeCustomEquations(profile.config) })) : [];
-    } catch {
-      return [];
+  const [sandboxExpr, setSandboxExpr] = useState(DEFAULT_SANDBOX_EXPRESSION);
+  const [sandboxResult, setSandboxResult] = useState<{value: number; error: string | null} | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [undo, setUndo] = useState<UndoState | null>(null);
+  const [profileName, setProfileName] = useState(config.name);
+  const [selectedProfileId, setSelectedProfileId] = useState('');
+  const [savedProfiles, setSavedProfiles] = useState<SavedEquationProfile[]>(loadSavedProfiles);
+  const [selectedUserEquationId, setSelectedUserEquationId] = useState('');
+
+  // Sincroniza el borrador con la configuración aplicada: al abrir el modal, o cuando la
+  // configuración cambia desde fuera y el borrador no tenía cambios pendientes.
+  const [syncedConfig, setSyncedConfig] = useState(config);
+  const [syncedOpen, setSyncedOpen] = useState(isOpen);
+  if (config !== syncedConfig || isOpen !== syncedOpen) {
+    const justOpened = isOpen && !syncedOpen;
+    setSyncedConfig(config);
+    setSyncedOpen(isOpen);
+    if (justOpened || sameConfig(draft, syncedConfig)) {
+      setDraft(cloneConfig(config));
+      if (justOpened) {
+        setProfileName(config.name);
+        setNotice(null);
+        setUndo(null);
+      }
     }
-  });
-  const [selectedUserEquationId, setSelectedUserEquationId] = useState<string>('');
+  }
 
-  // Sync draft if external config changes
-  React.useEffect(() => {
-    setDraft({ ...config });
-  }, [config, isOpen]);
-
-  React.useEffect(() => {
+  useEffect(() => {
     try {
       localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(savedProfiles));
     } catch {
-      // The profile remains available in memory for the current session.
+      // Sin almacenamiento disponible, los perfiles siguen en memoria durante la sesión.
     }
   }, [savedProfiles]);
 
-  React.useEffect(() => {
-    if (!draft.userEquations.some((equation) => equation.id === selectedUserEquationId)) {
-      setSelectedUserEquationId(draft.userEquations[0]?.id ?? '');
-    }
-  }, [draft.userEquations, selectedUserEquationId]);
+  useEffect(() => {
+    if (!undo) return;
+    const timer = window.setTimeout(() => setUndo(null), UNDO_WINDOW_MS);
+    return () => window.clearTimeout(timer);
+  }, [undo]);
 
+  const isDirty = useMemo(() => !sameConfig(draft, config), [draft, config]);
   const isModifiedFromSafe = useMemo(() => checkIfModified(draft), [draft]);
+  const previewDraft = useDebouncedValue(draft, PREVIEW_DEBOUNCE_MS);
 
-  // Selected equation definition
-  const selectedNode = useMemo(() => {
-    return EQUATION_CATALOG.find((eq) => eq.id === selectedEqId) || EQUATION_CATALOG[0];
-  }, [selectedEqId]);
+  const selectedNode = useMemo(
+    () => EQUATION_CATALOG.find((equation) => equation.id === selectedEqId) ?? EQUATION_CATALOG[0],
+    [selectedEqId],
+  );
+  const editableType = selectedNode.editableType;
 
-  // Group equations by category for STAR-CCM+ tree
-  const categories = useMemo(() => {
-    const list = [
-      {
-        id: 'thermodynamics',
-        name: '1. Física Termodinámica & Expansión',
-        icon: Flame,
-        badgeColor: 'text-amber-400 bg-amber-500/10 border-amber-500/30',
-      },
-      {
-        id: 'kinematics',
-        name: '2. Cinemática & Triángulos de Velocidad',
-        icon: Wind,
-        badgeColor: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30',
-      },
-      {
-        id: 'geometry',
-        name: '3. Geometría & Canal Meridional',
-        icon: Compass,
-        badgeColor: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30',
-      },
-      {
-        id: 'losses',
-        name: '4. Modelos de Pérdidas Aerodinámicas',
-        icon: Gauge,
-        badgeColor: 'text-indigo-400 bg-indigo-500/10 border-indigo-500/30',
-      },
-      {
-        id: 'sandbox',
-        name: '5. Sandbox & Fórmulas Libres',
-        icon: Code2,
-        badgeColor: 'text-purple-400 bg-purple-500/10 border-purple-500/30',
-      },
-    ];
+  const allGroups = useMemo<CategoryGroup[]>(
+    () =>
+      CATEGORIES.map((category) => {
+        const nodes = EQUATION_CATALOG.filter((equation) => equation.category === category.id);
+        return {...category, nodes, subfolders: groupBySubfolder(nodes)};
+      }),
+    [],
+  );
 
-    const q = searchQuery.toLowerCase().trim();
-
-    return list.map((cat) => {
-      const items = EQUATION_CATALOG.filter((eq) => eq.category === cat.id).filter((eq) => {
-        if (!q) return true;
-        return (
-          eq.name.toLowerCase().includes(q) ||
-          eq.asciiFormula.toLowerCase().includes(q) ||
-          eq.description.toLowerCase().includes(q) ||
-          eq.subfolder.toLowerCase().includes(q) ||
-          eq.symbols.some((s) => s.symbol.toLowerCase().includes(q) || s.name.toLowerCase().includes(q))
+  const query = searchQuery.trim().toLocaleLowerCase('es');
+  const visibleGroups = useMemo<CategoryGroup[]>(() => {
+    if (!query) return allGroups;
+    return allGroups
+      .map((group) => {
+        const nodes = group.nodes.filter(
+          (equation) =>
+            equation.name.toLocaleLowerCase('es').includes(query) ||
+            equation.asciiFormula.toLocaleLowerCase('es').includes(query) ||
+            equation.description.toLocaleLowerCase('es').includes(query) ||
+            equation.subfolder.toLocaleLowerCase('es').includes(query) ||
+            equation.symbols.some(
+              (symbol) =>
+                symbol.symbol.toLocaleLowerCase('es').includes(query) || symbol.name.toLocaleLowerCase('es').includes(query),
+            ),
         );
-      });
+        return {...group, nodes, subfolders: groupBySubfolder(nodes)};
+      })
+      .filter((group) => group.nodes.length > 0);
+  }, [allGroups, query]);
 
-      // Subgroup by subfolder
-      const subfolderMap: Record<string, EquationNode[]> = {};
-      items.forEach((item) => {
-        if (!subfolderMap[item.subfolder]) subfolderMap[item.subfolder] = [];
-        subfolderMap[item.subfolder].push(item);
-      });
+  const isExpanded = useMemo(
+    () => (id: CategoryId) => (query ? true : expandedFolders[id]),
+    [query, expandedFolders],
+  );
 
-      return {
-        ...cat,
-        items,
-        subfolders: Object.entries(subfolderMap).map(([title, nodes]) => ({ title, nodes })),
-      };
-    });
-  }, [searchQuery]);
+  const modifiedCategories = useMemo(
+    () => new Set(CATEGORIES.map((category) => category.id).filter((id) => isCategoryModified(draft, id))),
+    [draft],
+  );
 
-  // Live evaluation of selected node
-  const liveEvaluation = useMemo(() => {
-    if (!selectedNode) return null;
-    try {
-      return selectedNode.evaluate(evalContext, draft);
-    } catch {
-      return {
-        outputLabel: 'Error de evaluación',
-        outputValue: 'N/A',
-        unit: '',
-        detail: 'Valores fuera de rango o divergencia matemática',
-      };
-    }
-  }, [selectedNode, evalContext, draft]);
+  // Validación inmediata de cada expresión editable.
+  const expressionErrors = useMemo(
+    () => ({
+      soderbergZeta: getExpressionError(draft.soderberg.customExpression, SODERBERG_TEST_SCOPE, 0.05),
+      soderbergAr: getExpressionError(draft.soderberg.customArExpression, SODERBERG_TEST_SCOPE, 1),
+      customYpExpression: getExpressionError(draft.ainleyMathieson.customYpExpression, AINLEY_TEST_SCOPES.customYpExpression, 0.08),
+      customYpStatorExpression: getExpressionError(draft.ainleyMathieson.customYpStatorExpression, AINLEY_TEST_SCOPES.customYpStatorExpression, 0.05),
+      customYsExpression: getExpressionError(draft.ainleyMathieson.customYsExpression, AINLEY_TEST_SCOPES.customYsExpression, 0.02),
+      customYtcExpression: getExpressionError(draft.ainleyMathieson.customYtcExpression, AINLEY_TEST_SCOPES.customYtcExpression, 0.01),
+      height: getExpressionError(draft.sizing.customHeightExpression, SIZING_TEST_SCOPE, 0.01),
+      zweifel: getExpressionError(draft.zweifel.customZweifelExpression, ZWEIFEL_TEST_SCOPE, 0.85),
+      userLoss: getExpressionError(
+        draft.userDefinedLoss.lossFractionExpression,
+        evalContext ? buildUserLossScope(evalContext) : USER_LOSS_SAMPLE_SCOPE,
+        0,
+      ),
+    }),
+    [draft.soderberg, draft.ainleyMathieson, draft.sizing, draft.zweifel, draft.userDefinedLoss, evalContext],
+  );
 
-  const selectedUserEquation = draft.userEquations.find((equation) => equation.id === selectedUserEquationId);
-  const userEquationEvaluation = useMemo(() => {
-    if (!selectedUserEquation) return null;
-    return safeEvaluateMath(selectedUserEquation.expression, {
-      eps: evalContext.eps_deg,
-      AR: evalContext.aspectRatio,
-      turning: evalContext.eps_deg,
-      Rm: evalContext.Rm_m,
-      U: evalContext.U_ms,
-      Va: evalContext.Va_ms,
-      PR: evalContext.PR,
-      m_dot: evalContext.m_dot,
-      phi: evalContext.flowCoeff_phi,
-      beta1: evalContext.beta1_deg,
-      beta2: evalContext.beta2_deg,
-      Mach: evalContext.Mach_abs1,
-      MachRel: evalContext.Mach_rel1,
-      dh_is_kJkg: evalContext.dh0_kJkg,
-      eta_tt: evalContext.eta_tt,
-    }, 0);
-  }, [selectedUserEquation, evalContext]);
-
+  // Expresiones que el solver usaría ahora mismo para la ecuación seleccionada.
   const activeExpressionChecks = useMemo(() => {
-    const checks: { label: string; error: string | null }[] = [];
-    if (selectedNode.editableType === 'soderberg' && draft.soderberg.useCustomFormula) {
+    const checks: {label: string; error: string | null}[] = [];
+    if (editableType === 'soderberg' && draft.soderberg.useCustomFormula) {
+      checks.push({label: 'ζ₀', error: expressionErrors.soderbergZeta}, {label: 'Factor AR', error: expressionErrors.soderbergAr});
+    }
+    if (editableType === 'ainley' && draft.ainleyMathieson.useCustomFormula) {
       checks.push(
-        { label: 'ζ₀', error: getExpressionError(draft.soderberg.customExpression, { eps: 35, AR: 2.2 }, 0.05) },
-        { label: 'Factor AR', error: getExpressionError(draft.soderberg.customArExpression, { eps: 35, AR: 2.2 }, 1) },
+        {label: 'Yp rotor', error: expressionErrors.customYpExpression},
+        {label: 'Yp estator', error: expressionErrors.customYpStatorExpression},
+        {label: 'Ys', error: expressionErrors.customYsExpression},
+        {label: 'Ytc', error: expressionErrors.customYtcExpression},
       );
     }
-    if (selectedNode.editableType === 'ainley' && draft.ainleyMathieson.useCustomFormula) {
-      const baseScope = {
-        Yp_base: 0.08, Yp_nozzle: 0.05, Yp_impulse: 0.1, xi: 0.5, t_over_c: 0.2,
-        s_over_c: 0.8, beta1: 0.25, beta2: 0.5, beta_m: 0.375, b1: 0.25, b2: 0.5, bm: 0.375,
-        AR: 2, nozzleA: 0.025, nozzleB: 0.065, impulseA: 0.075, impulseB: 0.165,
-        secondaryCoeff: 0.033, lambda: 0.0165, CL_sc: 0.8, B_tip: 0.5, tipClearanceRatio: 0.015,
-        abs_alpha1: 30, alpha1: 0.5, alpha0: 0, alpha_m: 0.25,
-      };
-      checks.push(
-        { label: 'Yp rotor', error: getExpressionError(draft.ainleyMathieson.customYpExpression, baseScope, 0.08) },
-        { label: 'Yp estator', error: getExpressionError(draft.ainleyMathieson.customYpStatorExpression, baseScope, 0.05) },
-        { label: 'Ys', error: getExpressionError(draft.ainleyMathieson.customYsExpression, baseScope, 0.02) },
-        { label: 'Ytc', error: getExpressionError(draft.ainleyMathieson.customYtcExpression, baseScope, 0.01) },
-      );
+    if (editableType === 'sizing' && draft.sizing.useCustomHeightFormula) {
+      checks.push({label: 'Altura h', error: expressionErrors.height});
     }
-    if (selectedNode.editableType === 'sizing' && draft.sizing.useCustomHeightFormula) {
-      checks.push({ label: 'Altura h', error: getExpressionError(draft.sizing.customHeightExpression, { Area: 0.005, Area_ideal: 0.005, effectiveArea: 0.005, blockage: 0.02, Rm: 0.1 }, 0.01) });
+    if (editableType === 'zweifel' && draft.zweifel.useCustomZweifelFormula) {
+      checks.push({label: 'Zweifel ψ(s)', error: expressionErrors.zweifel});
     }
-    if (selectedNode.editableType === 'zweifel' && draft.zweifel.useCustomZweifelFormula) {
-      checks.push({ label: 'Zweifel ψ(s)', error: getExpressionError(draft.zweifel.customZweifelExpression, { s: 25, c_ax: 38, b1_rad: 0.3, b2_rad: 0.5, b1: 0.3, b2: 0.5, psi_Z: 0.85 }, 0.85) });
+    if (editableType === 'user_loss') {
+      checks.push({label: 'f_loss', error: expressionErrors.userLoss});
     }
     return checks;
-  }, [selectedNode.editableType, draft.soderberg, draft.ainleyMathieson, draft.sizing, draft.zweifel]);
+  }, [
+    editableType,
+    expressionErrors,
+    draft.soderberg.useCustomFormula,
+    draft.ainleyMathieson.useCustomFormula,
+    draft.sizing.useCustomHeightFormula,
+    draft.zweifel.useCustomZweifelFormula,
+  ]);
+  const hasInvalidExpression = activeExpressionChecks.some((check) => check.error !== null);
 
-  if (!isOpen) return null;
+  const liveEvaluation = useMemo(() => {
+    if (!evalContext) return null;
+    try {
+      return selectedNode.evaluate(evalContext, previewDraft);
+    } catch {
+      return {outputLabel: 'No se ha podido evaluar', outputValue: '—', unit: '', detail: 'Valores fuera de rango o divergencia numérica.'};
+    }
+  }, [selectedNode, evalContext, previewDraft]);
 
-  // Toggle folder open/collapse
-  const toggleFolder = (folderId: string) => {
-    setExpandedFolders((prev) => ({ ...prev, [folderId]: !prev[folderId] }));
+  const selectedUserEquation: UserEquation | undefined =
+    draft.userEquations.find((equation) => equation.id === selectedUserEquationId) ?? draft.userEquations[0];
+  const previewUserEquation = previewDraft.userEquations.find((equation) => equation.id === selectedUserEquation?.id);
+  const userEquationEvaluation = useMemo(() => {
+    if (!previewUserEquation || !evalContext) return null;
+    return safeEvaluateMath(previewUserEquation.expression, buildUserEquationScope(evalContext), 0);
+  }, [previewUserEquation, evalContext]);
+
+  const userLossPreview = useMemo(() => {
+    if (!evalContext) return null;
+    const ctx = evalContext;
+    const fallback = ctx.dh_is_Jkg > 0 ? (ctx.dh_loss_stator_Jkg + ctx.dh_loss_rotor_Jkg) / ctx.dh_is_Jkg : 0;
+    return safeEvaluateMath(previewDraft.userDefinedLoss.lossFractionExpression, buildUserLossScope(ctx), fallback);
+  }, [previewDraft.userDefinedLoss.lossFractionExpression, evalContext]);
+
+  // --- Edición del borrador -------------------------------------------------
+
+  const updateDraft = (updater: (previous: Config) => Config) => setDraft((previous) => updater(previous));
+
+  const patchDraft = <K extends SectionKey>(section: K, patch: Partial<Config[K]>) =>
+    updateDraft((previous) => patchSection(previous, section, patch));
+
+  const setSectionString = <K extends SectionKey>(section: K, key: StringKeys<Config[K]>, value: string) =>
+    patchDraft(section, {[key]: value} as Partial<Config[K]>);
+
+  // --- Acciones ---------------------------------------------------------------
+
+  const handleApply = () => {
+    const applied: Config = {...draft, isModified: checkIfModified(draft)};
+    setDraft(applied);
+    onSaveConfig(applied);
+    setNotice({tone: 'ok', text: 'Cambios aplicados al cálculo.'});
   };
 
-  const handleExpandAll = (expand: boolean) => {
-    const updated: Record<string, boolean> = {};
-    categories.forEach((c) => {
-      updated[c.id] = expand;
-    });
-    setExpandedFolders(updated);
+  const discardAndClose = () => {
+    setDraft(cloneConfig(config));
+    setNotice(null);
+    onClose();
   };
 
-  // Reset all to safe defaults
-  const handleResetToSafeDefaults = () => {
-    const safe = JSON.parse(JSON.stringify(SAFE_DEFAULT_EQUATIONS));
+  const handleRequestClose = () => {
+    if (isDirty && !window.confirm('Tienes cambios sin aplicar. ¿Cerrar y descartarlos?')) return;
+    discardAndClose();
+  };
+
+  const handleResetAll = () => {
+    const confirmed = window.confirm(
+      '¿Restablecer todas las ecuaciones a los valores de referencia? Se aplicará al cálculo y se descartarán los cambios sin aplicar. Podrás deshacerlo durante unos segundos.',
+    );
+    if (!confirmed) return;
+    const safe = cloneConfig(SAFE_DEFAULT_EQUATIONS);
+    setUndo({message: 'Ecuaciones restablecidas a los valores de referencia.', previousConfig: config, previousDraft: draft});
     setDraft(safe);
     setProfileName(safe.name);
     setSelectedProfileId('');
+    setNotice(null);
     onSaveConfig(safe);
   };
 
-  // Reset specific equation category to safe default
   const handleResetCurrentEquation = () => {
-    if (!selectedNode.editableType) return;
-    const type = selectedNode.editableType;
-    setDraft((prev) => {
-      const safe = SAFE_DEFAULT_EQUATIONS;
-      const updated = { ...prev };
-      if (type === 'soderberg') updated.soderberg = JSON.parse(JSON.stringify(safe.soderberg));
-      if (type === 'ainley') updated.ainleyMathieson = JSON.parse(JSON.stringify(safe.ainleyMathieson));
-      if (type === 'sizing') updated.sizing = JSON.parse(JSON.stringify(safe.sizing));
-      if (type === 'zweifel') updated.zweifel = JSON.parse(JSON.stringify(safe.zweifel));
-      if (type === 'thermo') updated.thermodynamics = JSON.parse(JSON.stringify(safe.thermodynamics));
-      if (type === 'kinematics') updated.kinematics = JSON.parse(JSON.stringify(safe.kinematics));
-      if (type === 'geometry') updated.geometry = JSON.parse(JSON.stringify(safe.geometry));
-      onSaveConfig(updated);
-      return updated;
+    if (!editableType || editableType === 'sandbox') return;
+    // Se restablece la sección en lo aplicado y en el borrador por separado, para no aplicar
+    // de rebote otros cambios pendientes del borrador.
+    const applied = resetSection(config, editableType);
+    const nextDraft = resetSection(draft, editableType);
+    setUndo({
+      message: `«${selectedNode.name}» restablecida a los valores de referencia.`,
+      previousConfig: config,
+      previousDraft: draft,
     });
+    setDraft(nextDraft);
+    onSaveConfig(applied);
   };
 
-  // Apply industrial template
+  const handleUndo = () => {
+    if (!undo) return;
+    setDraft(undo.previousDraft);
+    onSaveConfig(undo.previousConfig);
+    setUndo(null);
+    setNotice({tone: 'ok', text: 'Se ha deshecho el restablecimiento.'});
+  };
+
   const handleApplyTemplate = (templateId: string) => {
-    const tmpl = EQUATION_TEMPLATES.find((t) => t.id === templateId);
-    if (!tmpl) return;
-    const merged: CustomEquationsConfig = {
+    const template = EQUATION_TEMPLATES.find((item) => item.id === templateId);
+    if (!template) return;
+    const merged = cloneConfig({
       ...SAFE_DEFAULT_EQUATIONS,
-      ...tmpl.config,
-      name: tmpl.label,
+      ...template.config,
+      name: template.label,
       isModified: templateId !== 'default_safe',
-    };
+    });
     setDraft(merged);
-    setProfileName(tmpl.label);
+    setProfileName(template.label);
     setSelectedProfileId('');
-    onSaveConfig(merged);
+    setNotice({tone: 'ok', text: `Plantilla «${template.label}» cargada en el borrador. Pulsa «Aplicar» para usarla.`});
   };
 
   const saveEquationProfile = () => {
     const name = profileName.trim();
     if (!name) {
-      setImportError('Escribe un nombre para guardar la configuración.');
+      setNotice({tone: 'danger', text: 'Escribe un nombre para guardar la configuración.'});
       return;
     }
-    const existing = savedProfiles.find((profile) => profile.name.toLowerCase() === name.toLowerCase());
+    const existing = savedProfiles.find((profile) => profile.name.toLocaleLowerCase('es') === name.toLocaleLowerCase('es'));
     const profile: SavedEquationProfile = {
-      id: existing?.id ?? `profile-${Date.now()}`,
+      id: existing?.id ?? `perfil-${Date.now()}`,
       name,
-      config: normalizeCustomEquations({ ...draft, name }),
+      config: normalizeCustomEquations({...draft, name}),
     };
-    setSavedProfiles((previous) => existing
-      ? previous.map((item) => item.id === existing.id ? profile : item)
-      : [...previous, profile]);
+    setSavedProfiles((previous) =>
+      existing ? previous.map((item) => (item.id === existing.id ? profile : item)) : [...previous, profile],
+    );
     setSelectedProfileId(profile.id);
-    setDraft(profile.config);
-    onSaveConfig(profile.config);
-    setImportError(null);
+    updateDraft((previous) => ({...previous, name}));
+    setNotice({tone: 'ok', text: `Perfil «${name}» guardado en este navegador.`});
   };
 
-  const applyEquationProfile = (profileId: string) => {
+  const loadEquationProfile = (profileId: string) => {
     setSelectedProfileId(profileId);
     const profile = savedProfiles.find((item) => item.id === profileId);
     if (!profile) return;
-    const applied = normalizeCustomEquations(profile.config);
-    setDraft(applied);
+    setDraft(normalizeCustomEquations(profile.config));
     setProfileName(profile.name);
-    onSaveConfig(applied);
+    setNotice({tone: 'ok', text: `Perfil «${profile.name}» cargado en el borrador. Pulsa «Aplicar» para usarlo.`});
   };
 
   const deleteEquationProfile = () => {
-    if (!selectedProfileId) return;
-    setSavedProfiles((previous) => previous.filter((profile) => profile.id !== selectedProfileId));
+    const profile = savedProfiles.find((item) => item.id === selectedProfileId);
+    if (!profile || !window.confirm(`¿Eliminar el perfil «${profile.name}» de este navegador?`)) return;
+    setSavedProfiles((previous) => previous.filter((item) => item.id !== profile.id));
     setSelectedProfileId('');
+    setNotice({tone: 'ok', text: `Perfil «${profile.name}» eliminado.`});
+  };
+
+  const handleExportJSON = () => {
+    const blob = new Blob([JSON.stringify(draft, null, 2)], {type: 'application/json'});
+    const date = new Date().toISOString().slice(0, 10);
+    downloadBlob(blob, `ecuaciones-turbina-${date}.json`);
+  };
+
+  const handleImportJSON = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    // Se vacía para que volver a elegir el mismo fichero dispare otra vez el evento.
+    input.value = '';
+    if (!file) return;
+    if (file.size > MAX_IMPORT_BYTES) {
+      setNotice({
+        tone: 'danger',
+        text: `El archivo ocupa ${Math.ceil(file.size / 1024)} KB y el máximo admitido es 256 KB.`,
+      });
+      return;
+    }
+    file
+      .text()
+      .then((text) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          setNotice({tone: 'danger', text: 'El archivo no contiene un JSON válido.'});
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          setNotice({tone: 'danger', text: 'El JSON debe ser un objeto con la configuración de ecuaciones.'});
+          return;
+        }
+        const {config: imported, resetCount} = normalizeCustomEquationsReport(parsed);
+        const next: Config = {...imported, isModified: checkIfModified(imported)};
+        setDraft(next);
+        setProfileName(next.name);
+        setSelectedProfileId('');
+        const resetText =
+          resetCount === 0
+            ? ''
+            : resetCount === 1
+              ? ' 1 campo con formato no válido se ha restablecido.'
+              : ` ${resetCount} campos con formato no válido se han restablecido.`;
+        setNotice({
+          tone: resetCount > 0 ? 'warn' : 'ok',
+          text: `Archivo «${file.name}» cargado en el borrador.${resetText} Pulsa «Aplicar» para usarlo.`,
+        });
+      })
+      .catch(() => setNotice({tone: 'danger', text: 'No se ha podido leer el archivo.'}));
+  };
+
+  const testSandboxExpression = () => {
+    if (!evalContext) return;
+    setSandboxResult(safeEvaluateMath(sandboxExpr, buildBasicScope(evalContext), 0.05));
   };
 
   const addUserEquation = () => {
-    const id = `user-equation-${Date.now()}`;
+    const id = `ecuacion-${Date.now()}`;
     updateDraft((previous) => ({
       ...previous,
-      userEquations: [...previous.userEquations, {
-        id,
-        name: `Ecuación ${previous.userEquations.length + 1}`,
-        expression: 'eta_tt',
-        description: 'Expresión añadida por el usuario. Aún no está asignada a una ecuación del solver.',
-      }],
+      userEquations: [
+        ...previous.userEquations,
+        {
+          id,
+          name: `Ecuación ${previous.userEquations.length + 1}`,
+          expression: 'eta_tt',
+          description: 'Expresión añadida por el usuario. No está conectada a ninguna ecuación del solver.',
+        },
+      ],
     }));
     setSelectedUserEquationId(id);
   };
 
-  const updateUserEquation = (id: string, changes: Partial<CustomEquationsConfig['userEquations'][number]>) => {
+  const updateUserEquation = (id: string, changes: Partial<UserEquation>) =>
     updateDraft((previous) => ({
       ...previous,
-      userEquations: previous.userEquations.map((equation) => equation.id === id ? { ...equation, ...changes } : equation),
+      userEquations: previous.userEquations.map((equation) => (equation.id === id ? {...equation, ...changes} : equation)),
     }));
-  };
 
-  const deleteUserEquation = (id: string) => {
+  const deleteUserEquation = (id: string) =>
     updateDraft((previous) => ({
       ...previous,
       userEquations: previous.userEquations.filter((equation) => equation.id !== id),
     }));
-  };
 
-  // Export JSON configuration
-  const handleExportJSON = () => {
-    const blob = new Blob([JSON.stringify(draft, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `turbomachine_starccm_equations_${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  const toggleFolder = (id: CategoryId, expand?: boolean) =>
+    setExpandedFolders((previous) => ({...previous, [id]: expand ?? !previous[id]}));
 
-  // Import JSON configuration
-  const handleImportJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setImportError(null);
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const setAllFolders = (expand: boolean) =>
+    setExpandedFolders({thermodynamics: expand, kinematics: expand, geometry: expand, losses: expand, sandbox: expand});
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const parsed = JSON.parse(event.target?.result as string);
-        if (!parsed.soderberg || !parsed.ainleyMathieson) {
-          throw new Error('Estructura de ecuaciones no válida');
-        }
-        const updated = normalizeCustomEquations({ ...parsed, isModified: true });
-        setDraft(updated);
-        setProfileName(updated.name);
-        setSelectedProfileId('');
-        onSaveConfig(updated);
-      } catch (err: any) {
-        setImportError(`Error al importar: ${err?.message || 'Archivo JSON corrupto'}`);
-      }
-    };
-    reader.readAsText(file);
-  };
+  // --- Render ------------------------------------------------------------------
 
-  // Sandbox evaluator
-  const testSandboxExpression = () => {
-    const res = safeEvaluateMath(
-      sandboxExpr,
-      {
-        eps: evalContext.eps_deg,
-        AR: evalContext.aspectRatio,
-        turning: evalContext.eps_deg,
-        Rm: evalContext.Rm_m,
-        U: evalContext.U_ms,
-        Va: evalContext.Va_ms,
-        PR: evalContext.PR,
-        m_dot: evalContext.m_dot,
-      },
-      0.05
-    );
-    setSandboxResult(res);
-  };
+  const statusBadge = isModifiedFromSafe ? (
+    <span className="hidden items-center gap-1 rounded-full border border-amber-200 bg-warn-soft px-2.5 py-0.5 text-caption font-semibold text-warn sm:inline-flex">
+      <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> Modificado
+    </span>
+  ) : (
+    <span className="hidden items-center gap-1 rounded-full border border-emerald-200 bg-ok-soft px-2.5 py-0.5 text-caption font-semibold text-ok sm:inline-flex">
+      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" /> Valores de referencia
+    </span>
+  );
 
-  const updateDraft = (updater: (prev: CustomEquationsConfig) => CustomEquationsConfig) => {
-    const updated = updater({ ...draft, isModified: true });
-    setDraft(updated);
-    onSaveConfig(updated);
-  };
+  const footer = (
+    <>
+      <span className="mr-auto flex items-center gap-1.5 text-label" aria-live="polite">
+        {isDirty ? (
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-warn-soft px-2.5 py-0.5 font-semibold text-warn">
+            <span className="h-2 w-2 rounded-full bg-warn" aria-hidden="true" /> Cambios sin aplicar
+          </span>
+        ) : (
+          <span className="text-ink-3">Sin cambios pendientes</span>
+        )}
+      </span>
+      <button type="button" onClick={handleResetAll} className="btn-secondary text-danger">
+        <RotateCcw className="h-4 w-4" aria-hidden="true" /> Restablecer todo
+      </button>
+      <button type="button" onClick={discardAndClose} className="btn-secondary">
+        Cancelar
+      </button>
+      <button type="button" onClick={handleApply} disabled={!isDirty} className="btn-primary">
+        <CheckCircle2 className="h-4 w-4" aria-hidden="true" /> Aplicar
+      </button>
+    </>
+  );
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-2 md:p-4">
-      <div className="bg-slate-950 border border-slate-700/80 rounded-2xl w-full max-w-7xl h-[92vh] flex flex-col shadow-2xl overflow-hidden text-slate-100">
-        {/* --- HEADER: STAR-CCM+ STYLE TOPBAR --- */}
-        <div className="px-5 py-3.5 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-600/30 border border-cyan-500/40 text-cyan-400">
-              <Layers className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-base font-bold text-white tracking-wide">
-                  Árbol de Ecuaciones & Modelos de Física (Estilo STAR-CCM+)
-                </h2>
-                {isModifiedFromSafe ? (
-                  <span className="px-2 py-0.5 text-[11px] font-mono font-semibold rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
-                    Modificado
-                  </span>
-                ) : (
-                  <span className="px-2 py-0.5 text-[11px] font-mono font-medium rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                    <ShieldCheck className="w-3 h-3" /> Punto Seguro (Canónico)
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-400">
-                Ecuaciones termodinámicas, cinemáticas, geométricas y de pérdidas para:{' '}
-                <span className="text-cyan-300 font-semibold">{currentStageName}</span>
-              </p>
-            </div>
-          </div>
-
-          {/* Action buttons: Reset Punto Seguro, Templates, Close */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleResetToSafeDefaults}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 transition-all shadow-sm"
-              title="Restablecer todas las ecuaciones a valores bibliográficos seguros"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Reset Punto Seguro Global</span>
-            </button>
-
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
-              title="Cerrar ventana"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
-
-        {/* --- TEMPLATES & CONFIG BAR --- */}
-        <div className="px-5 py-2 bg-slate-900/60 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2 overflow-x-auto py-0.5">
-            <span className="text-slate-400 font-semibold text-[11px] flex items-center gap-1">
-              <Sparkles className="w-3 h-3 text-amber-400" /> Plantillas:
+    <Modal
+      open={isOpen}
+      onClose={handleRequestClose}
+      size="full"
+      title={
+        <span className="flex min-w-0 flex-col">
+          <span>Ecuaciones y correlaciones</span>
+          <span className="truncate text-label font-normal text-ink-3">
+            Etapa en cálculo: <span className="font-medium text-ink-2">{currentStageName}</span>
+          </span>
+        </span>
+      }
+      headerActions={statusBadge}
+      footer={footer}
+    >
+      <div className="flex flex-col gap-4">
+        {/* Plantillas, perfiles y archivos */}
+        <section aria-label="Plantillas, perfiles y archivos" className="space-y-3 rounded-card border border-line bg-surface-muted p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="flex items-center gap-1.5 text-label font-semibold text-ink-2">
+              <Sparkles className="h-4 w-4 text-warn" aria-hidden="true" /> Plantillas
             </span>
-            {EQUATION_TEMPLATES.map((tmpl) => (
-              <button
-                key={tmpl.id}
-                onClick={() => handleApplyTemplate(tmpl.id)}
-                className={`px-2.5 py-1 rounded text-[11px] font-mono transition-all border whitespace-nowrap ${
-                  draft.name === tmpl.label
-                    ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50 font-semibold shadow'
-                    : 'bg-slate-950/60 text-slate-400 border-slate-800 hover:bg-slate-850 hover:text-slate-200'
-                }`}
-                title={tmpl.description}
+            {EQUATION_TEMPLATES.map((template) => {
+              const active = draft.name === template.label;
+              return (
+                <button
+                  key={template.id}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => handleApplyTemplate(template.id)}
+                  title={template.description}
+                  className={`min-h-9 rounded-lg border px-2.5 py-1 text-label ${
+                    active
+                      ? 'border-cyan-300 bg-accent-soft font-semibold text-accent-strong'
+                      : 'border-line-strong bg-surface text-ink-2 hover:bg-surface-sunken'
+                  }`}
+                >
+                  {template.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="flex min-w-48 flex-1 flex-col gap-1">
+              <label htmlFor={profileSelectId} className="flex items-center gap-1.5 text-label font-medium text-ink-2">
+                <Save className="h-4 w-4 text-accent" aria-hidden="true" /> Perfiles guardados
+              </label>
+              <select
+                id={profileSelectId}
+                value={selectedProfileId}
+                onChange={(event) => loadEquationProfile(event.target.value)}
+                className="field w-full max-sm:h-10 max-sm:text-base"
               >
-                {tmpl.label}
+                <option value="">Cargar un perfil…</option>
+                {savedProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex min-w-48 flex-1 flex-col gap-1">
+              <label htmlFor={profileNameId} className="text-label font-medium text-ink-2">
+                Nombre de la configuración
+              </label>
+              <input
+                id={profileNameId}
+                value={profileName}
+                onChange={(event) => setProfileName(event.target.value)}
+                placeholder="Por ejemplo: Soderberg calibrado"
+                className="field w-full max-sm:h-10 max-sm:text-base"
+              />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" onClick={saveEquationProfile} className="btn-secondary">
+                <Save className="h-4 w-4" aria-hidden="true" /> Guardar perfil
               </button>
-            ))}
+              <button type="button" onClick={deleteEquationProfile} disabled={!selectedProfileId} className="btn-secondary">
+                <Trash2 className="h-4 w-4" aria-hidden="true" /> Eliminar
+              </button>
+              <button type="button" onClick={handleExportJSON} className="btn-secondary">
+                <Download className="h-4 w-4" aria-hidden="true" /> Exportar JSON
+              </button>
+              <button type="button" onClick={() => importInputRef.current?.click()} className="btn-secondary">
+                <Upload className="h-4 w-4" aria-hidden="true" /> Importar JSON
+              </button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept="application/json,.json"
+                onChange={handleImportJSON}
+                className="sr-only"
+                tabIndex={-1}
+                aria-hidden="true"
+              />
+            </div>
           </div>
+          <p className="text-caption text-ink-3">
+            Los perfiles se guardan en este navegador. Usa el JSON para llevarlos a otro equipo. Plantillas, perfiles e
+            importaciones se cargan en el borrador: no cambian el cálculo hasta que pulses «Aplicar».
+          </p>
+        </section>
 
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleExportJSON}
-              className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-mono transition-colors"
-              title="Exportar calibración completa de ecuaciones a JSON"
-            >
-              <Download className="w-3 h-3 text-cyan-400" />
-              <span>Exportar JSON</span>
-            </button>
-            <label className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-mono cursor-pointer transition-colors">
-              <Upload className="w-3 h-3 text-amber-400" />
-              <span>Importar JSON</span>
-              <input type="file" accept=".json" onChange={handleImportJSON} className="hidden" />
-            </label>
-          </div>
-        </div>
-
-        <div className="px-5 py-2.5 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center gap-2.5 text-xs">
-          <span className="text-slate-300 font-semibold flex items-center gap-1.5"><Save className="w-3.5 h-3.5 text-cyan-400" /> Perfiles guardados</span>
-          <select
-            value={selectedProfileId}
-            onChange={(e) => applyEquationProfile(e.target.value)}
-            className="min-w-48 bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200"
-            aria-label="Cargar perfil de ecuaciones guardado"
+        {notice && (
+          <div
+            role={notice.tone === 'danger' ? 'alert' : 'status'}
+            className={`flex items-start justify-between gap-3 rounded-lg border px-3 py-2 text-label ${
+              notice.tone === 'danger'
+                ? 'border-rose-200 bg-danger-soft text-danger'
+                : notice.tone === 'warn'
+                  ? 'border-amber-200 bg-warn-soft text-warn'
+                  : 'border-emerald-200 bg-ok-soft text-ok'
+            }`}
           >
-            <option value="">Cargar configuración…</option>
-            {savedProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
-          </select>
-          <input
-            value={profileName}
-            onChange={(e) => setProfileName(e.target.value)}
-            placeholder="Nombre de la configuración"
-            aria-label="Nombre de la configuración de ecuaciones"
-            className="min-w-48 flex-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-slate-100 placeholder-slate-500"
-          />
-          <button
-            onClick={saveEquationProfile}
-            className="flex items-center gap-1.5 rounded bg-cyan-700 hover:bg-cyan-600 px-3 py-1.5 text-white font-semibold"
-            title="Guardar este conjunto de ecuaciones en este navegador"
-          ><Save className="w-3.5 h-3.5" /> Guardar perfil</button>
-          <button
-            onClick={deleteEquationProfile}
-            disabled={!selectedProfileId}
-            className="flex items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1.5 text-slate-300 hover:bg-rose-950 hover:text-rose-200 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="Eliminar el perfil seleccionado"
-          ><Trash2 className="w-3.5 h-3.5" /> Eliminar</button>
-          <span className="w-full text-[10px] text-slate-500">Se guardan automáticamente en este navegador. Usa JSON para trasladarlos a otro equipo.</span>
-        </div>
-
-        {/* Error message if file import fails */}
-        {importError && (
-          <div className="px-5 py-2 bg-rose-950/60 border-b border-rose-800 text-rose-300 text-xs flex items-center justify-between">
-            <span>{importError}</span>
-            <button onClick={() => setImportError(null)} className="text-rose-400 hover:text-white">
-              <X className="w-3.5 h-3.5" />
+            <span>{notice.text}</span>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              aria-label="Cerrar el aviso"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md hover:bg-surface/60"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
             </button>
           </div>
         )}
 
-        {/* --- MAIN SPLIT CONTAINER: STAR-CCM+ TREE (LEFT) + INSPECTOR (RIGHT) --- */}
-        <div className="flex-1 flex overflow-hidden">
-          {/* ========================================================= */}
-          {/* LEFT PANEL: STAR-CCM+ SIMULATION PHYSICS TREE EXPLORER   */}
-          {/* ========================================================= */}
-          <div className="w-80 md:w-96 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
-            {/* Tree search & quick controls */}
-            <div className="p-3 border-b border-slate-800 bg-slate-900/40 flex flex-col gap-2">
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-500" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Filtrar ecuaciones o variables..."
-                  className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-900 border border-slate-700/80 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 font-mono"
-                />
-                {searchQuery && (
-                  <button
-                    onClick={() => setSearchQuery('')}
-                    className="absolute right-2 top-2 text-slate-400 hover:text-white"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
+        {undo && (
+          <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line-strong bg-surface px-3 py-2 text-label text-ink-2 shadow-card">
+            <span>{undo.message}</span>
+            <button type="button" onClick={handleUndo} className="btn-secondary">
+              <Undo2 className="h-4 w-4" aria-hidden="true" /> Deshacer
+            </button>
+          </div>
+        )}
 
-              <div className="flex items-center justify-between text-[11px] text-slate-400">
-                <span className="font-mono">Árbol de Simulación</span>
-                <div className="flex items-center gap-2 font-mono text-[10px]">
-                  <button
-                    onClick={() => handleExpandAll(true)}
-                    className="hover:text-cyan-400 transition-colors"
-                  >
-                    [+ Expandir]
-                  </button>
-                  <button
-                    onClick={() => handleExpandAll(false)}
-                    className="hover:text-cyan-400 transition-colors"
-                  >
-                    [- Colapsar]
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Tree folder list */}
-            <div className="flex-1 overflow-y-auto p-2 space-y-1.5 font-mono text-xs select-none">
-              {categories.map((cat) => {
-                const isExpanded = expandedFolders[cat.id];
-                const IconComponent = cat.icon;
-                const hasModified =
-                  (cat.id === 'losses' && (checkIfModified(draft) && (draft.soderberg.useCustomFormula || draft.soderberg.b !== 0.06 || draft.ainleyMathieson.secondaryCoeff !== 0.033))) ||
-                  (cat.id === 'geometry' && draft.sizing.blockageFactor > 0);
-
-                return (
-                  <div key={cat.id} className="rounded-lg bg-slate-900/40 border border-slate-800/60 overflow-hidden">
-                    {/* Folder Header */}
-                    <button
-                      onClick={() => toggleFolder(cat.id)}
-                      className="w-full px-2.5 py-2 flex items-center justify-between hover:bg-slate-850/80 transition-colors text-left"
-                    >
-                      <div className="flex items-center gap-1.5 truncate">
-                        {isExpanded ? (
-                          <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        ) : (
-                          <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        )}
-                        {isExpanded ? (
-                          <FolderOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        ) : (
-                          <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        )}
-                        <span className="font-semibold text-slate-200 text-xs truncate">
-                          {cat.name}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {hasModified && (
-                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                        )}
-                        <span className="px-1.5 py-0.2 rounded text-[10px] bg-slate-800 text-slate-400">
-                          {cat.items.length}
-                        </span>
-                      </div>
-                    </button>
-
-                    {/* Subfolders & Equation Items */}
-                    {isExpanded && (
-                      <div className="pl-4 pr-1 py-1 space-y-1 border-t border-slate-800/40 bg-slate-950/60">
-                        {cat.subfolders.map((sub) => (
-                          <div key={sub.title} className="space-y-0.5">
-                            <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-slate-400 flex items-center gap-1">
-                              <span className="w-1 h-1 rounded-full bg-slate-600" />
-                              <span>{sub.title}</span>
-                            </div>
-
-                            <div className="pl-2 space-y-0.5">
-                              {sub.nodes.map((node) => {
-                                const isSelected = selectedEqId === node.id;
-                                return (
-                                  <button
-                                    key={node.id}
-                                    onClick={() => setSelectedEqId(node.id)}
-                                    className={`w-full px-2 py-1.5 rounded-md flex items-center justify-between text-left transition-all ${
-                                      isSelected
-                                        ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 font-semibold shadow-sm'
-                                        : 'text-slate-300 hover:bg-slate-900 hover:text-white'
-                                    }`}
-                                  >
-                                    <div className="flex items-center gap-1.5 truncate">
-                                      <FileCode className={`w-3 h-3 shrink-0 ${isSelected ? 'text-cyan-400' : 'text-slate-400'}`} />
-                                      <span className="truncate text-[11px]">{node.name}</span>
-                                    </div>
-                                    {node.editableType && (
-                                      <span className="text-[9px] px-1 rounded bg-slate-800 text-slate-300 uppercase shrink-0">
-                                        edit
-                                      </span>
-                                    )}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Tree Footer / Stage info */}
-            <div className="p-2.5 border-t border-slate-800 bg-slate-900/60 text-[11px] text-slate-400 flex items-center justify-between">
-              <span>Etapa en cálculo:</span>
-              <span className="text-cyan-300 font-mono font-semibold">{currentStageName}</span>
-            </div>
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[20rem_minmax(0,1fr)] lg:gap-6">
+          {/* Selector de ecuación: árbol en escritorio, desplegable en móvil */}
+          <div className="flex flex-col gap-1 lg:hidden">
+            <label htmlFor={mobileSelectId} className="text-label font-medium text-ink-2">
+              Ecuación
+            </label>
+            <select
+              id={mobileSelectId}
+              value={selectedNode.id}
+              onChange={(event) => setSelectedEqId(event.target.value)}
+              className="field h-10 w-full text-base"
+            >
+              {allGroups.map((group) => (
+                <optgroup key={group.id} label={group.name}>
+                  {group.nodes.map((node) => (
+                    <option key={node.id} value={node.id}>
+                      {node.name}
+                      {node.editableType ? ' (editable)' : ''}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
           </div>
 
-          {/* ========================================================= */}
-          {/* RIGHT PANEL: STAR-CCM+ OBJECT & EQUATION INSPECTOR        */}
-          {/* ========================================================= */}
-          <div className="flex-1 bg-slate-900/20 overflow-y-auto p-4 md:p-6 flex flex-col gap-5">
-            {/* Breadcrumb Path & Header */}
-            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
-              <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono">
-                <span className="hover:text-slate-200">Simulación</span>
-                <ChevronRight className="w-3.5 h-3.5 text-slate-600" />
-                <span className="hover:text-slate-200">{selectedNode.category}</span>
-                <ChevronRight className="w-3.5 h-3.5 text-slate-600" />
-                <span className="text-cyan-400 font-semibold">{selectedNode.subfolder}</span>
-              </div>
-
-              {selectedNode.editableType && (
+          <aside className="hidden min-w-0 flex-col gap-2 lg:sticky lg:top-0 lg:flex lg:max-h-[calc(100dvh-11rem)] lg:self-start lg:overflow-y-auto">
+            <h3 id={treeLabelId} className="text-body font-semibold text-ink">
+              Árbol de ecuaciones
+            </h3>
+            <div className="relative">
+              <label htmlFor={searchId} className="sr-only">
+                Filtrar ecuaciones o variables
+              </label>
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-3" aria-hidden="true" />
+              <input
+                id={searchId}
+                type="search"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Filtrar ecuaciones o variables"
+                autoComplete="off"
+                className="field w-full pl-8 pr-8"
+              />
+              {searchQuery && (
                 <button
-                  onClick={handleResetCurrentEquation}
-                  className="flex items-center gap-1 px-2.5 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors font-mono"
-                  title="Restablecer los parámetros de esta ecuación a valores canónicos estándar"
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  aria-label="Borrar el filtro"
+                  className="absolute right-1 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-ink-3 hover:bg-surface-sunken hover:text-ink"
                 >
-                  <RotateCcw className="w-3 h-3 text-cyan-400" />
-                  <span>↺ Reset Ecuación a Punto Seguro</span>
+                  <X className="h-4 w-4" aria-hidden="true" />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-3 text-label">
+              <button type="button" onClick={() => setAllFolders(true)} className="font-medium text-accent hover:text-accent-strong hover:underline">
+                Expandir todo
+              </button>
+              <button type="button" onClick={() => setAllFolders(false)} className="font-medium text-accent hover:text-accent-strong hover:underline">
+                Contraer todo
+              </button>
+            </div>
+            {visibleGroups.length === 0 ? (
+              <p className="rounded-lg border border-line bg-surface-muted px-3 py-4 text-center text-label text-ink-3">
+                Ninguna ecuación coincide con el filtro.
+              </p>
+            ) : (
+              <EquationTree
+                groups={visibleGroups}
+                isExpanded={isExpanded}
+                onToggle={toggleFolder}
+                selectedId={selectedNode.id}
+                onSelect={setSelectedEqId}
+                modifiedCategories={modifiedCategories}
+                labelledBy={treeLabelId}
+              />
+            )}
+          </aside>
+
+          {/* Inspector de la ecuación seleccionada */}
+          <div className="flex min-w-0 flex-col gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <nav aria-label="Ubicación" className="flex flex-wrap items-center gap-1 text-label text-ink-3">
+                <span>{CATEGORY_NAME[selectedNode.category]}</span>
+                <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                <span className="font-medium text-accent-strong">{selectedNode.subfolder}</span>
+              </nav>
+              {editableType && editableType !== 'sandbox' && (
+                <button
+                  type="button"
+                  onClick={handleResetCurrentEquation}
+                  className="btn-secondary"
+                  title="Restablece los parámetros de esta ecuación a los valores de referencia y lo aplica al cálculo"
+                >
+                  <RotateCcw className="h-4 w-4" aria-hidden="true" /> Restablecer esta ecuación
                 </button>
               )}
             </div>
 
-            {/* Equation Title & Description Card */}
-            <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-5 shadow-lg flex flex-col gap-4">
+            <section className="flex flex-col gap-4 rounded-card border border-line bg-surface p-4 shadow-card sm:p-5">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <h3 className="text-lg font-bold text-white tracking-wide">
-                    {selectedNode.name}
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-1 max-w-2xl leading-relaxed">
-                    {selectedNode.description}
+                <div className="min-w-0">
+                  <h3 className="text-lg font-semibold text-ink">{selectedNode.name}</h3>
+                  <p className="mt-1 max-w-3xl text-body leading-relaxed text-ink-2">{selectedNode.description}</p>
+                </div>
+                <p className="max-w-full rounded-lg border border-line bg-surface-muted px-2.5 py-1 text-caption text-ink-3">
+                  Referencia: <span className="font-medium text-ink-2">{selectedNode.theoreticalRef}</span>
+                </p>
+              </div>
+
+              <figure className="flex flex-col gap-2 rounded-lg border border-line bg-surface-muted p-4">
+                <figcaption className="flex items-center gap-1.5 text-label font-semibold text-ink-2">
+                  <Sigma className="h-4 w-4 text-accent" aria-hidden="true" /> Formulación
+                </figcaption>
+                <div className="overflow-x-auto whitespace-pre-wrap break-words py-1 font-mono text-lg text-ink select-all">
+                  {selectedNode.asciiFormula}
+                </div>
+              </figure>
+
+              <div className="rounded-lg border border-line bg-surface p-3.5" aria-live="polite">
+                <div className="mb-1.5 flex items-center gap-1.5 text-label font-semibold text-ink-2">
+                  <Gauge className="h-4 w-4 text-accent" aria-hidden="true" /> Vista previa con el borrador
+                </div>
+                {!evalContext ? (
+                  <p className="text-label text-ink-3">
+                    Todavía no hay un diseño calculado. Carga el ejemplo o lanza el barrido para ver los valores de la etapa.
                   </p>
-                </div>
-                <div className="px-2.5 py-1 rounded bg-slate-800/80 border border-slate-700 text-[11px] text-slate-300 font-mono shrink-0">
-                  Ref: <span className="text-cyan-300 font-semibold">{selectedNode.theoreticalRef}</span>
-                </div>
-              </div>
-
-              {/* Mathematical Equation Display Box (LaTeX style) */}
-              <div className="bg-slate-950/90 border border-cyan-500/30 rounded-lg p-4 flex flex-col gap-2 shadow-inner">
-                <div className="text-[11px] font-mono text-cyan-400 font-semibold uppercase tracking-wider flex items-center justify-between">
-                  <span className="flex items-center gap-1.5">
-                    <Sigma className="w-3.5 h-3.5" /> Formulación Matemática
-                  </span>
-                  <span className="text-slate-400 font-normal lowercase">{selectedNode.asciiFormula}</span>
-                </div>
-                <div className="py-2 text-center text-lg md:text-xl font-serif text-cyan-100 tracking-wide select-all overflow-x-auto">
-                  {selectedNode.latex}
-                </div>
-              </div>
-
-              {/* Live Stage Evaluation Box */}
-              {liveEvaluation && (
-                <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-3.5 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-2 rounded bg-cyan-950/80 border border-cyan-800 text-cyan-400">
-                      <Gauge className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="text-xs font-semibold text-white">
+                ) : hasInvalidExpression ? (
+                  <p className="text-label text-danger">
+                    Hay expresiones no válidas; corrígelas para ver la vista previa. Mientras tanto, el solver usaría la fórmula
+                    de respaldo.
+                  </p>
+                ) : liveEvaluation ? (
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-body text-ink-2">
                         {liveEvaluation.outputLabel}:{' '}
-                        <span className="text-cyan-300 font-mono text-sm ml-1 font-bold">
+                        <span className="text-title font-semibold tabular-nums text-accent-strong">
                           {liveEvaluation.outputValue} {liveEvaluation.unit}
                         </span>
-                      </div>
-                      {liveEvaluation.detail && (
-                        <div className="text-[11px] text-slate-400 font-mono">
-                          {liveEvaluation.detail}
-                        </div>
+                      </p>
+                      {liveEvaluation.detail && <p className="text-label text-ink-3">{liveEvaluation.detail}</p>}
+                      {activeExpressionChecks.length > 0 && (
+                        <p className="mt-1 flex items-center gap-1 text-caption text-ok">
+                          <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          {activeExpressionChecks.map((check) => check.label).join(', ')}: expresiones válidas
+                        </p>
                       )}
-                      {activeExpressionChecks.map((check) => (
-                        <div key={check.label} className={`text-[11px] font-mono ${check.error ? 'text-rose-300' : 'text-emerald-300'}`}>
-                          {check.label}: {check.error ? `expresión no válida (${check.error}); se usará la fórmula de respaldo` : 'expresión válida'}
-                        </div>
-                      ))}
                     </div>
+                    <span className="text-caption text-ink-3">Etapa: {currentStageName}</span>
                   </div>
-                  <span className="text-[11px] font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-800/60 px-2 py-0.5 rounded flex items-center gap-1">
-                    <CheckCircle2 className="w-3 h-3" /> Evaluado en vivo para {currentStageName}
-                  </span>
-                </div>
-              )}
-            </div>
+                ) : null}
+              </div>
+            </section>
 
-            {/* Variable Symbols & Units Table */}
-            <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col gap-2.5">
-              <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5 font-mono">
-                <Info className="w-3.5 h-3.5 text-cyan-400" /> Variables & Unidades Físicas
+            <section className="rounded-card border border-line bg-surface p-4 shadow-card">
+              <h4 className="mb-2 flex items-center gap-1.5 text-body font-semibold text-ink">
+                <Info className="h-4 w-4 text-accent" aria-hidden="true" /> Variables y unidades
               </h4>
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs font-mono">
+                <table className="w-full text-left text-label">
+                  <caption className="sr-only">Símbolos de la ecuación «{selectedNode.name}»</caption>
                   <thead>
-                    <tr className="border-b border-slate-800 text-slate-400 text-[11px]">
-                      <th className="py-1.5 px-2">Símbolo</th>
-                      <th className="py-1.5 px-2">Magnitud / Concepto</th>
-                      <th className="py-1.5 px-2">Unidad SI</th>
+                    <tr className="border-b border-line text-caption text-ink-3">
+                      <th scope="col" className="px-2 py-1.5 font-medium">
+                        Símbolo
+                      </th>
+                      <th scope="col" className="px-2 py-1.5 font-medium">
+                        Magnitud
+                      </th>
+                      <th scope="col" className="px-2 py-1.5 font-medium">
+                        Unidad
+                      </th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-850">
-                    {selectedNode.symbols.map((s) => (
-                      <tr key={s.symbol} className="hover:bg-slate-800/30">
-                        <td className="py-1.5 px-2 text-cyan-300 font-semibold">{s.symbol}</td>
-                        <td className="py-1.5 px-2 text-slate-300">{s.name}</td>
-                        <td className="py-1.5 px-2 text-slate-400">{s.unit}</td>
+                  <tbody className="divide-y divide-line">
+                    {selectedNode.symbols.map((symbol) => (
+                      <tr key={symbol.symbol}>
+                        <th scope="row" className="whitespace-nowrap px-2 py-1.5 font-mono font-semibold text-accent-strong">
+                          {symbol.symbol}
+                        </th>
+                        <td className="px-2 py-1.5 text-ink-2">{symbol.name}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5 text-ink-3">{symbol.unit}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-            </div>
+            </section>
 
-            {/* ========================================================= */}
-            {/* PARAMETRIC CONTROLS (IF EDITABLE NODE IS SELECTED)        */}
-            {/* ========================================================= */}
-            {selectedNode.editableType && (
-              <div className="bg-slate-900/80 border border-cyan-500/30 rounded-xl p-5 flex flex-col gap-4 shadow-lg">
-                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                  <h4 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Sliders className="w-4 h-4 text-cyan-400" />
-                    Parámetros Editables & Criterios Empíricos
+            {editableType && (
+              <section className="flex flex-col gap-4 rounded-card border border-cyan-200 bg-surface p-4 shadow-card sm:p-5">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line pb-2">
+                  <h4 className="flex items-center gap-2 text-title font-semibold text-ink">
+                    <Sliders className="h-4 w-4 text-accent" aria-hidden="true" /> Parámetros editables
                   </h4>
-                  <span className="text-[11px] font-mono text-amber-400 bg-amber-950/60 border border-amber-800/60 px-2 py-0.5 rounded">
-                    Afecta en tiempo real al cálculo de la turbina
-                  </span>
+                  {editableType !== 'sandbox' && (
+                    <span className="text-caption text-ink-3">Los cambios se aplican al cálculo al pulsar «Aplicar».</span>
+                  )}
                 </div>
 
-                {/* 1. SODERBERG CONTROLS */}
-                {selectedNode.editableType === 'soderberg' && (
-                  <div className="space-y-4 text-xs font-mono">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Constante Base (a) [Def: 0.04]</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.01"
-                          max="0.15"
-                          value={draft.soderberg.a}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.04;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, a: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
+                {editableType === 'soderberg' && (
+                  <div className="flex flex-col gap-4">
+                    <p
+                      className={`self-start rounded-full border px-2.5 py-0.5 text-caption font-medium ${
+                        isSoderbergCustom(draft.soderberg)
+                          ? 'border-amber-200 bg-warn-soft text-warn'
+                          : 'border-emerald-200 bg-ok-soft text-ok'
+                      }`}
+                    >
+                      {isSoderbergCustom(draft.soderberg)
+                        ? 'El solver usará la versión personalizada de Soderberg'
+                        : 'El solver usará la correlación de referencia de Soderberg'}
+                    </p>
+                    <fieldset className="flex flex-col gap-2">
+                      <legend className="mb-2 text-body font-semibold text-ink-2">Pérdida nominal ζ₀ = a + b·(ε/100)^c − t_k·(t/c)/0,20</legend>
+                      <SectionNumberFields section="soderberg" specs={SODERBERG_ZETA_SPECS} draft={draft} onPatch={patchDraft} />
+                    </fieldset>
+                    <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                      <fieldset className="rounded-lg border border-line p-3">
+                        <legend className="px-1 text-body font-semibold text-ink-2">Rotor: d, e</legend>
+                        <SectionNumberFields
+                          section="soderberg"
+                          specs={SODERBERG_ROTOR_SPECS}
+                          draft={draft}
+                          onPatch={patchDraft}
+                          className="xl:grid-cols-2"
                         />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Pérdida a deflexión nula.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Sensibilidad Angular (b) [Def: 0.06]</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.01"
-                          max="0.25"
-                          value={draft.soderberg.b}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.06;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, b: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
+                      </fieldset>
+                      <fieldset className="rounded-lg border border-line p-3">
+                        <legend className="px-1 text-body font-semibold text-ink-2">Estator: d, e</legend>
+                        <SectionNumberFields
+                          section="soderberg"
+                          specs={SODERBERG_STATOR_SPECS}
+                          draft={draft}
+                          onPatch={patchDraft}
+                          className="xl:grid-cols-2"
                         />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Ponderación cuadrática con ε.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Exponente de Deflexión (c) [Def: 2.0]</div>
-                        <input
-                          type="number"
-                          step="0.1"
-                          min="1.0"
-                          max="3.5"
-                          value={draft.soderberg.c}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 2.0;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, c: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Gradiente con deflexión ε.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Intercepto de Esbeltez (d) [Def: 0.975]</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.8"
-                          max="1.2"
-                          value={draft.soderberg.d}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.975;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, d: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Término independiente de AR.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Penalización Pared (e) [Def: 0.075]</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.01"
-                          max="0.25"
-                          value={draft.soderberg.e}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.075;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, e: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Penalización para 1/AR.</span>
-                      </div>
+                      </fieldset>
                     </div>
+                    <p className="text-caption text-ink-3">Factor de aspecto: 1 + ζ = (1 + ζ₀)·(d + e/AR), con d y e propios de cada fila.</p>
 
-                    <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={draft.soderberg.useCustomFormula}
-                          onChange={(e) => {
-                            const chk = e.target.checked;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, useCustomFormula: chk } }));
-                          }}
-                          className="rounded text-cyan-500 bg-slate-900 border-slate-700 focus:ring-0"
-                        />
-                        <span className="text-slate-300 text-xs font-semibold">
-                          Habilitar Fórmula JavaScript Libre de Soderberg
-                        </span>
-                      </label>
+                    <div className="border-t border-line pt-3">
+                      <Toggle
+                        checked={draft.soderberg.useCustomFormula}
+                        onChange={(checked) => patchDraft('soderberg', {useCustomFormula: checked})}
+                      >
+                        Usar expresiones propias para Soderberg
+                      </Toggle>
                     </div>
-
                     {draft.soderberg.useCustomFormula && (
-                      <div className="space-y-2 bg-slate-950 p-3 rounded-lg border border-cyan-500/40">
-                        <div className="text-slate-400 text-[11px]">Expresión para ζ₀(eps):</div>
-                        <input
-                          type="text"
+                      <div className="grid grid-cols-1 gap-3 rounded-lg border border-cyan-200 bg-surface-muted p-3 xl:grid-cols-2">
+                        <ExpressionField
+                          label="Expresión de ζ₀"
                           value={draft.soderberg.customExpression}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, customExpression: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 font-mono text-xs"
+                          onChange={(value) => setSectionString('soderberg', 'customExpression', value)}
+                          placeholder={SAFE_DEFAULT_EQUATIONS.soderberg.customExpression}
+                          error={expressionErrors.soderbergZeta}
                         />
-                        <div className="text-slate-400 text-[11px]">Expresión para Factor de Aspecto f(AR):</div>
-                        <input
-                          type="text"
+                        <ExpressionField
+                          label="Expresión del factor de aspecto f(AR)"
                           value={draft.soderberg.customArExpression}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            updateDraft((p) => ({ ...p, soderberg: { ...p.soderberg, customArExpression: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 font-mono text-xs"
+                          onChange={(value) => setSectionString('soderberg', 'customArExpression', value)}
+                          placeholder={SAFE_DEFAULT_EQUATIONS.soderberg.customArExpression}
+                          error={expressionErrors.soderbergAr}
                         />
+                        <div className="xl:col-span-2">
+                          <VariableHint scope={SODERBERG_TEST_SCOPE} note="row vale 0 en el estator y 1 en el rotor; tc es t/c." />
+                        </div>
                       </div>
                     )}
                   </div>
                 )}
 
-                {/* 2. AINLEY-MATHIESON CONTROLS */}
-                {selectedNode.editableType === 'ainley' && (
-                  <div className="space-y-4 text-xs font-mono">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Tobera Base A [Def: 0.025]</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.01"
-                          max="0.10"
-                          value={draft.ainleyMathieson.nozzleA}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.025;
-                            updateDraft((p) => ({ ...p, ainleyMathieson: { ...p.ainleyMathieson, nozzleA: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Perfil pura tobera (α₁=0).</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Impulsión Base A [Def: 0.075]</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.02"
-                          max="0.20"
-                          value={draft.ainleyMathieson.impulseA}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.075;
-                            updateDraft((p) => ({ ...p, ainleyMathieson: { ...p.ainleyMathieson, impulseA: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Perfil pura impulsión (R=0).</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Coef. Secundario λ [Def: 0.033]</div>
-                        <input
-                          type="number"
-                          step="0.002"
-                          min="0.01"
-                          max="0.08"
-                          value={draft.ainleyMathieson.secondaryCoeff}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.033;
-                            updateDraft((p) => ({ ...p, ainleyMathieson: { ...p.ainleyMathieson, secondaryCoeff: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">Pérdida secundaria λ/AR.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Coef. Huelgo B_tip [Def: 0.50]</div>
-                        <input
-                          type="number"
-                          step="0.05"
-                          min="0.10"
-                          max="0.80"
-                          value={draft.ainleyMathieson.tipClearanceCoeff}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.50;
-                            updateDraft((p) => ({ ...p, ainleyMathieson: { ...p.ainleyMathieson, tipClearanceCoeff: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none focus:border-cyan-500"
-                        />
-                        <span className="text-[10px] text-slate-400 mt-1 block">0.50 voladizo / 0.25 banda.</span>
-                      </div>
-                    </div>
-                    <label className="flex items-center gap-2 border-t border-slate-800 pt-3 cursor-pointer">
-                      <input
-                        type="checkbox"
+                {editableType === 'ainley' && (
+                  <div className="flex flex-col gap-4">
+                    <SectionNumberFields section="ainleyMathieson" specs={AINLEY_SPECS} draft={draft} onPatch={patchDraft} />
+                    <div className="border-t border-line pt-3">
+                      <Toggle
                         checked={draft.ainleyMathieson.useCustomFormula}
-                        onChange={(e) => updateDraft((p) => ({
-                          ...p,
-                          ainleyMathieson: { ...p.ainleyMathieson, useCustomFormula: e.target.checked },
-                        }))}
-                        className="rounded text-cyan-500 bg-slate-900 border-slate-700"
-                      />
-                      <span className="text-slate-200 text-xs font-semibold">Usar expresiones personalizadas en el modelo A&amp;M</span>
-                    </label>
+                        onChange={(checked) => patchDraft('ainleyMathieson', {useCustomFormula: checked})}
+                      >
+                        Usar expresiones propias en el modelo de Ainley-Mathieson
+                      </Toggle>
+                    </div>
                     {draft.ainleyMathieson.useCustomFormula && (
-                      <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 bg-slate-950 p-3 rounded-lg border border-cyan-500/40">
-                        {([
-                          ['customYpExpression', 'Pérdida de perfil del rotor (Yp)', 'Yp_base * Math.pow(t_over_c / 0.20, xi)'],
-                          ['customYpStatorExpression', 'Pérdida de perfil del estator', 'nozzleA + nozzleB * Math.pow(abs_alpha1 / 100, 2.4) * Math.pow(s_over_c, -0.4)'],
-                          ['customYsExpression', 'Pérdida secundaria (Ys)', '(secondaryCoeff / AR) * Math.pow(CL_sc, 2) * Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3)'],
-                          ['customYtcExpression', 'Pérdida de holgura (Ytc)', 'B_tip * tipClearanceRatio * Math.pow(CL_sc, 2) * Math.pow(Math.cos(b2), 2) / Math.pow(Math.cos(bm), 3)'],
-                        ] as const).map(([key, label, placeholder]) => (
-                          <label key={key} className="block space-y-1.5">
-                            <span className="text-slate-300 text-[11px]">{label}</span>
-                            <input
-                              type="text"
-                              value={draft.ainleyMathieson[key]}
-                              onChange={(e) => updateDraft((p) => ({
-                                ...p,
-                                ainleyMathieson: { ...p.ainleyMathieson, [key]: e.target.value },
-                              }))}
-                              placeholder={placeholder}
-                              className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-cyan-200 font-mono text-xs focus:outline-none focus:border-cyan-500"
-                            />
-                          </label>
+                      <div className="grid grid-cols-1 gap-3 rounded-lg border border-cyan-200 bg-surface-muted p-3 xl:grid-cols-2">
+                        {(
+                          [
+                            ['customYpExpression', 'Pérdida de perfil del rotor (Yp)', SAFE_DEFAULT_EQUATIONS.ainleyMathieson.customYpExpression],
+                            ['customYpStatorExpression', 'Pérdida de perfil del estator', SAFE_DEFAULT_EQUATIONS.ainleyMathieson.customYpStatorExpression],
+                            ['customYsExpression', 'Pérdida secundaria (Ys)', YS_PLACEHOLDER],
+                            ['customYtcExpression', 'Pérdida por holgura de punta (Ytc)', SAFE_DEFAULT_EQUATIONS.ainleyMathieson.customYtcExpression],
+                          ] as const
+                        ).map(([key, label, placeholder]) => (
+                          <ExpressionField
+                            key={key}
+                            label={label}
+                            value={draft.ainleyMathieson[key]}
+                            onChange={(value) => setSectionString('ainleyMathieson', key, value)}
+                            placeholder={placeholder}
+                            error={expressionErrors[key]}
+                            hint={<VariableHint scope={AINLEY_TEST_SCOPES[key]} />}
+                          />
                         ))}
-                        <p className="xl:col-span-2 text-[11px] text-slate-400 leading-relaxed">
-                          Expresiones permitidas: aritmética y funciones `Math.*`. Variables disponibles: Yp_base, Yp_nozzle, Yp_impulse, xi, t_over_c, s_over_c, nozzleA, nozzleB, impulseA, impulseB, secondaryCoeff, AR, CL_sc, b1, b2, bm, B_tip y tipClearanceRatio. Los resultados conservan límites físicos de seguridad.
+                        <p className="text-caption text-ink-3 xl:col-span-2">
+                          Ángulos en radianes. Los resultados conservan los límites físicos de seguridad del solver.
                         </p>
                       </div>
                     )}
                   </div>
                 )}
 
-                {/* 3. SIZING & BLOCKAGE CONTROLS */}
-                {selectedNode.editableType === 'sizing' && (
-                  <div className="space-y-4 text-xs font-mono">
-                    <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-slate-300 font-semibold">
-                          Factor de Bloqueo de Capa Límite (K_bloqueo):
-                        </span>
-                        <span className="text-cyan-300 text-sm font-bold">
-                          {(draft.sizing.blockageFactor * 100).toFixed(1)}%
-                        </span>
-                      </div>
+                {editableType === 'sizing' && (
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-col gap-2 rounded-lg border border-line bg-surface-muted p-3">
+                      <NumberField
+                        label="Bloqueo por capa límite"
+                        symbol="K_bloqueo"
+                        unit="%"
+                        value={Number((draft.sizing.blockageFactor * 100).toFixed(4))}
+                        min={0}
+                        max={15}
+                        step={0.5}
+                        hint="A_efectiva = A / (1 − K). 0 % es el canal ideal."
+                        typical="4 % en turbinas de gas; 8–15 % en microturbinas o Reynolds bajo"
+                        onChange={(value) => patchDraft('sizing', {blockageFactor: value / 100})}
+                      />
                       <input
                         type="range"
-                        min="0"
-                        max="0.15"
-                        step="0.005"
+                        min={0}
+                        max={0.15}
+                        step={0.005}
                         value={draft.sizing.blockageFactor}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value);
-                          updateDraft((p) => ({ ...p, sizing: { ...p.sizing, blockageFactor: val } }));
-                        }}
-                        className="w-full accent-cyan-400 cursor-pointer"
+                        onChange={(event) => patchDraft('sizing', {blockageFactor: Number(event.target.value)})}
+                        aria-label="Bloqueo por capa límite (control deslizante)"
+                        className="w-full cursor-pointer accent-accent"
                       />
-                      <div className="flex justify-between text-[10px] text-slate-500">
-                        <span>0% (Ideal / Sin bloqueo)</span>
-                        <span>4% (Típico turbina de gas)</span>
-                        <span>8% - 15% (Microturbinas / Baja Re)</span>
-                      </div>
                     </div>
-                    <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                      <label className="block text-slate-300 text-[11px] mb-1">Relación de aspecto para cuerda automática (h/c)</label>
-                      <input type="number" step="0.1" min="0.5" max="8" value={draft.sizing.aspectRatioTarget} onChange={(e) => updateDraft((p) => ({ ...p, sizing: { ...p.sizing, aspectRatioTarget: Math.max(0.5, Number(e.target.value) || 1.6) } }))} className="w-full bg-slate-900 border border-slate-700 px-2 py-1.5 rounded text-cyan-200" />
-                      <span className="text-[10px] text-slate-400 mt-1 block">Se aplica cuando no se especifica una cuerda axial en Geometría.</span>
+                    <SectionNumberFields section="sizing" specs={SIZING_SPECS} draft={draft} onPatch={patchDraft} />
+                    <div className="border-t border-line pt-3">
+                      <Toggle
+                        checked={draft.sizing.useCustomHeightFormula}
+                        onChange={(checked) => patchDraft('sizing', {useCustomHeightFormula: checked})}
+                      >
+                        Usar una ecuación propia para la altura del álabe (afecta al área y a la geometría)
+                      </Toggle>
                     </div>
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input type="checkbox" checked={draft.sizing.useCustomHeightFormula} onChange={(e) => updateDraft((p) => ({ ...p, sizing: { ...p.sizing, useCustomHeightFormula: e.target.checked } }))} className="rounded text-cyan-500 bg-slate-900 border-slate-700" />
-                      <span className="text-slate-200 font-semibold">Usar ecuación personalizada de altura (afecta área y geometría)</span>
-                    </label>
                     {draft.sizing.useCustomHeightFormula && (
-                      <div className="bg-slate-950 p-3 rounded-lg border border-cyan-500/40 space-y-2">
-                        <label className="block text-slate-300 text-[11px]">h = f(Area, effectiveArea, blockage, Rm)</label>
-                        <input type="text" value={draft.sizing.customHeightExpression} onChange={(e) => updateDraft((p) => ({ ...p, sizing: { ...p.sizing, customHeightExpression: e.target.value } }))} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-cyan-200 font-mono text-xs" />
-                        <p className="text-[11px] text-slate-400">La altura devuelta debe estar en metros. Ejemplo: (Area / (1 - blockage)) / (2 * Math.PI * Rm).</p>
+                      <div className="rounded-lg border border-cyan-200 bg-surface-muted p-3">
+                        <ExpressionField
+                          label="h = f(Area, effectiveArea, blockage, Rm), en metros"
+                          value={draft.sizing.customHeightExpression}
+                          onChange={(value) => setSectionString('sizing', 'customHeightExpression', value)}
+                          placeholder={SAFE_DEFAULT_EQUATIONS.sizing.customHeightExpression}
+                          error={expressionErrors.height}
+                          hint={<VariableHint scope={SIZING_TEST_SCOPE} />}
+                        />
                       </div>
                     )}
                   </div>
                 )}
 
-                {/* 4. ZWEIFEL LOADING CONTROLS */}
-                {selectedNode.editableType === 'zweifel' && (
-                  <div className="space-y-4 text-xs font-mono">
-                    <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-slate-300 font-semibold">
-                          Coeficiente Objetivo de Carga Zweifel (Ψ_Z):
-                        </span>
-                        <span className="text-cyan-300 text-sm font-bold">
-                          {draft.zweifel.psi_Z_target.toFixed(2)}
-                        </span>
-                      </div>
+                {editableType === 'zweifel' && (
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-col gap-2 rounded-lg border border-line bg-surface-muted p-3">
+                      <NumberField
+                        label="Coeficiente objetivo de Zweifel"
+                        symbol="ψ_Z"
+                        value={draft.zweifel.psi_Z_target}
+                        min={0.6}
+                        max={1.2}
+                        step={0.01}
+                        hint="0,60 muy sólido (conservador) · 0,85 óptimo clásico · 1,10 muy espaciado (riesgo alto)."
+                        typical={`${formatDefault(SAFE_DEFAULT_EQUATIONS.zweifel.psi_Z_target)} (por defecto)`}
+                        onChange={(value) => patchDraft('zweifel', {psi_Z_target: value})}
+                      />
                       <input
                         type="range"
-                        min="0.60"
-                        max="1.20"
-                        step="0.02"
+                        min={0.6}
+                        max={1.2}
+                        step={0.01}
                         value={draft.zweifel.psi_Z_target}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value);
-                          updateDraft((p) => ({ ...p, zweifel: { ...p.zweifel, psi_Z_target: val } }));
-                        }}
-                        className="w-full accent-cyan-400 cursor-pointer"
+                        onChange={(event) => patchDraft('zweifel', {psi_Z_target: Number(event.target.value)})}
+                        aria-label="Coeficiente objetivo de Zweifel (control deslizante)"
+                        className="w-full cursor-pointer accent-accent"
                       />
-                      <div className="flex justify-between text-[10px] text-slate-500">
-                        <span>0.60 (Muy sólido / Conservador)</span>
-                        <span>0.85 (Óptimo clásico Zweifel)</span>
-                        <span>1.10 (Muy espaciado / Alto riesgo)</span>
+                    </div>
+                    <SectionNumberFields section="zweifel" specs={ZWEIFEL_SPECS} draft={draft} onPatch={patchDraft} />
+                    <div className="border-t border-line pt-3">
+                      <Toggle
+                        checked={draft.zweifel.useCustomZweifelFormula}
+                        onChange={(checked) => patchDraft('zweifel', {useCustomZweifelFormula: checked})}
+                      >
+                        Resolver el paso con una expresión propia
+                      </Toggle>
+                    </div>
+                    {draft.zweifel.useCustomZweifelFormula && (
+                      <div className="rounded-lg border border-cyan-200 bg-surface-muted p-3">
+                        <ExpressionField
+                          label="ψ_Z = f(s, c_ax, b1_rad, b2_rad)"
+                          value={draft.zweifel.customZweifelExpression}
+                          onChange={(value) => setSectionString('zweifel', 'customZweifelExpression', value)}
+                          placeholder={SAFE_DEFAULT_EQUATIONS.zweifel.customZweifelExpression}
+                          error={expressionErrors.zweifel}
+                          hint={<VariableHint scope={ZWEIFEL_TEST_SCOPE} note="El paso se obtiene resolviendo la expresión numéricamente." />}
+                        />
                       </div>
-                      <label className="block text-slate-300 text-[11px]">Multiplicador de la ecuación</label>
-                      <input type="number" step="0.1" min="0.1" max="10" value={draft.zweifel.multiplier} onChange={(e) => updateDraft((p) => ({ ...p, zweifel: { ...p.zweifel, multiplier: Number(e.target.value) || 2 } }))} className="w-full bg-slate-900 border border-slate-700 px-2 py-1.5 rounded text-cyan-200" />
-                      <label className="flex items-center gap-2 cursor-pointer pt-2 border-t border-slate-800">
-                        <input type="checkbox" checked={draft.zweifel.useCustomZweifelFormula} onChange={(e) => updateDraft((p) => ({ ...p, zweifel: { ...p.zweifel, useCustomZweifelFormula: e.target.checked } }))} className="rounded text-cyan-500 bg-slate-900 border-slate-700" />
-                        <span className="text-slate-200 font-semibold">Resolver paso con expresión personalizada</span>
-                      </label>
-                      {draft.zweifel.useCustomZweifelFormula && (
-                        <div className="space-y-1.5">
-                          <input type="text" value={draft.zweifel.customZweifelExpression} onChange={(e) => updateDraft((p) => ({ ...p, zweifel: { ...p.zweifel, customZweifelExpression: e.target.value } }))} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-cyan-200 font-mono text-xs" />
-                          <p className="text-[11px] text-slate-400">Variables: s, c_ax, b1_rad, b2_rad, psi_Z. El paso se obtiene resolviendo la expresión numéricamente.</p>
-                        </div>
+                    )}
+                  </div>
+                )}
+
+                {editableType === 'thermo' && (
+                  <SectionNumberFields section="thermodynamics" specs={THERMO_SPECS} draft={draft} onPatch={patchDraft} className="xl:grid-cols-2" />
+                )}
+
+                {editableType === 'kinematics' && (
+                  <SectionNumberFields section="kinematics" specs={KINEMATICS_SPECS} draft={draft} onPatch={patchDraft} className="xl:grid-cols-2" />
+                )}
+
+                {editableType === 'geometry' && (
+                  <div className="flex flex-col gap-3">
+                    <SectionNumberFields section="geometry" specs={GEOMETRY_SPECS} draft={draft} onPatch={patchDraft} />
+                    {draft.geometry.freeVortexExponent !== 1 && (
+                      <p className="flex items-start gap-1.5 rounded-lg border border-amber-200 bg-warn-soft px-3 py-2 text-label text-warn">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                        Con n ≠ 1 el equilibrio radial no recalcula la velocidad axial a lo largo del radio: las secciones de
+                        buje y punta son orientativas.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {editableType === 'user_loss' && (
+                  <div className="flex flex-col gap-3">
+                    <Toggle
+                      checked={draft.userDefinedLoss.enabled}
+                      onChange={(checked) => patchDraft('userDefinedLoss', {enabled: checked})}
+                    >
+                      Usar este modelo propio en el solver
+                    </Toggle>
+                    <PlainTextField
+                      label="Nombre del modelo"
+                      value={draft.userDefinedLoss.name}
+                      onChange={(value) => setSectionString('userDefinedLoss', 'name', value)}
+                    />
+                    <ExpressionField
+                      label="Fracción del salto isentrópico perdida, f_loss (adimensional)"
+                      value={draft.userDefinedLoss.lossFractionExpression}
+                      onChange={(value) => setSectionString('userDefinedLoss', 'lossFractionExpression', value)}
+                      placeholder={SAFE_DEFAULT_EQUATIONS.userDefinedLoss.lossFractionExpression}
+                      error={expressionErrors.userLoss}
+                      multiline
+                      rows={3}
+                    />
+                    <p className="rounded-lg border border-line bg-surface-muted p-3 text-caption leading-relaxed text-ink-2">
+                      Variables: <code className="font-mono">{USER_LOSS_VARIABLES.join(', ')}</code>. La fracción se limita a
+                      [0, 0,95] y η_tt = 1 − f_loss. Esta correlación propia necesita una validación independiente.
+                    </p>
+                    <div className="rounded-lg border border-line bg-surface p-3 text-label" aria-live="polite">
+                      <span className="font-semibold text-ink-2">Resultado en la etapa actual: </span>
+                      {!userLossPreview ? (
+                        <span className="text-ink-3">sin diseño calculado.</span>
+                      ) : userLossPreview.error ? (
+                        <span className="text-danger">
+                          expresión no válida; el solver usará la pérdida de Soderberg como respaldo.
+                        </span>
+                      ) : (
+                        <span className="tabular-nums text-ok">
+                          {(Math.max(0, Math.min(0.95, userLossPreview.value)) * 100).toFixed(2)} % de pérdida · η_tt{' '}
+                          {(100 * (1 - Math.max(0, Math.min(0.95, userLossPreview.value)))).toFixed(1)} %
+                        </span>
                       )}
                     </div>
                   </div>
                 )}
 
-                {/* 5. THERMODYNAMIC CORRECTION CONTROLS */}
-                {selectedNode.editableType === 'thermo' && (
-                  <div className="space-y-3 text-xs font-mono">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Factor Reheat por Etapa (α_rh)</div>
-                        <input
-                          type="number"
-                          step="0.005"
-                          min="0.00"
-                          max="0.05"
-                          value={draft.thermodynamics.reheatFactorPerStage}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.015;
-                            updateDraft((p) => ({ ...p, thermodynamics: { ...p.thermodynamics, reheatFactorPerStage: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none"
-                        />
-                        <span className="text-[10px] text-slate-500 mt-1 block">Compensación de isobaras multietapa.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Recuperación Cinética Inter-Etapa</div>
-                        <input
-                          type="number"
-                          step="0.05"
-                          min="0.00"
-                          max="0.80"
-                          value={draft.thermodynamics.kineticEnergyCarryOverFraction}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.0;
-                            updateDraft((p) => ({ ...p, thermodynamics: { ...p.thermodynamics, kineticEnergyCarryOverFraction: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none"
-                        />
-                        <span className="text-[10px] text-slate-500 mt-1 block">Fracción de V₂ aprovechada en siguiente tobera.</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {selectedNode.editableType === 'user_loss' && (
-                  <div className="space-y-3 text-xs font-mono">
-                    <label className="flex items-center gap-2 rounded-lg border border-cyan-800/60 bg-slate-950 p-3 text-slate-200">
-                      <input type="checkbox" checked={draft.userDefinedLoss.enabled} onChange={(e) => updateDraft((p) => ({ ...p, userDefinedLoss: { ...p.userDefinedLoss, enabled: e.target.checked } }))} />
-                      Usar este modelo propio en el solver
-                    </label>
-                    <label className="block space-y-1">
-                      <span className="text-slate-400">Nombre del modelo</span>
-                      <input value={draft.userDefinedLoss.name} onChange={(e) => updateDraft((p) => ({ ...p, userDefinedLoss: { ...p.userDefinedLoss, name: e.target.value } }))} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-slate-100" />
-                    </label>
-                    <label className="block space-y-1">
-                      <span className="text-slate-400">Fracción de salto isentrópico perdida: f_loss (adimensional)</span>
-                      <textarea rows={3} value={draft.userDefinedLoss.lossFractionExpression} onChange={(e) => updateDraft((p) => ({ ...p, userDefinedLoss: { ...p.userDefinedLoss, lossFractionExpression: e.target.value } }))} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-cyan-200 font-mono" />
-                    </label>
-                    <p className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-[11px] leading-relaxed text-slate-300">Variables: dh_is, dh_actual, dh_loss_stator, dh_loss_rotor, dh_loss_soderberg, dh_loss_ainley, Mach, MachRel, MachRel2, U, Va, V1, W1, V2, W2, AR, eps, phi, psi, PR, m_dot, P01, T01, gamma, zeta_N, zeta_R, Yp_rotor, Ys_rotor, Ytc_rotor. La fracción se limita a [0, 0.95], por tanto η_tt = 1 − f_loss. Esta correlación propia requiere validación independiente.</p>
-                    <div className="rounded-lg bg-slate-950 border border-slate-800 p-3 text-[11px] text-emerald-200">Resultado en la etapa actual: {(() => {
-                      const c = evalContext;
-                      const fallback = c.dh_is_Jkg > 0 ? (c.dh_loss_stator_Jkg + c.dh_loss_rotor_Jkg) / c.dh_is_Jkg : 0;
-                      const { value, error } = safeEvaluateMath(draft.userDefinedLoss.lossFractionExpression, {
-                        dh_is: c.dh_is_Jkg, dh_actual: c.dh0_kJkg * 1000,
-                        dh_loss_stator: c.dh_loss_stator_Jkg, dh_loss_rotor: c.dh_loss_rotor_Jkg,
-                        dh_loss_soderberg: c.dh_loss_soderberg_Jkg, dh_loss_ainley: c.dh_loss_ainley_Jkg,
-                        Mach: c.Mach_abs1, MachRel: c.Mach_rel1, MachRel2: c.Mach_rel2,
-                        U: c.U_ms, Va: c.Va_ms, V1: c.V1_ms, W1: c.W1_ms, V2: c.V2_ms, W2: c.W2_ms,
-                        AR: c.aspectRatio, eps: c.eps_deg, phi: c.flowCoeff_phi, psi: c.stageLoading_psi,
-                        PR: c.PR, m_dot: c.m_dot, P01: c.P01_bar * 1e5, T01: c.T01_K,
-                        gamma: c.gamma, zeta_N: c.zeta_N, zeta_R: c.zeta_R, Yp_rotor: c.Yp_rotor, Ys_rotor: c.Ys_rotor, Ytc_rotor: c.Ytc_rotor,
-                      }, fallback);
-                      return error ? <span className="text-rose-300">Expresión no válida: {error}; el solver usará la pérdida de Soderberg como respaldo.</span> : `${(Math.max(0, Math.min(0.95, value)) * 100).toFixed(2)}% de pérdida · η_tt ${(Math.max(5, 100 * (1 - value))).toFixed(1)}%`;
-                    })()}</div>
-                  </div>
-                )}
-
-                {/* 6. KINEMATIC & EULER CONTROLS */}
-                {selectedNode.editableType === 'kinematics' && (
-                  <div className="space-y-3 text-xs font-mono">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Multiplicador Trabajo Euler (Slip / Rendimiento)</div>
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0.80"
-                          max="1.05"
-                          value={draft.kinematics.eulerWorkMultiplier}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 1.0;
-                            updateDraft((p) => ({ ...p, kinematics: { ...p.kinematics, eulerWorkMultiplier: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none"
-                        />
-                        <span className="text-[10px] text-slate-500 mt-1 block">Factor de corrección de trabajo específico.</span>
-                      </div>
-
-                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                        <div className="text-slate-400 text-[11px] mb-1">Límite Mínimo De Haller (W₂/W₁)</div>
-                        <input
-                          type="number"
-                          step="0.02"
-                          min="0.60"
-                          max="0.85"
-                          value={draft.kinematics.deHallerMin}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value) || 0.72;
-                            updateDraft((p) => ({ ...p, kinematics: { ...p.kinematics, deHallerMin: val } }));
-                          }}
-                          className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none"
-                        />
-                        <span className="text-[10px] text-slate-500 mt-1 block">Criterio clásico de desprendimiento (0.72).</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* 7. GEOMETRY & VORTEX CONTROLS */}
-                {selectedNode.editableType === 'geometry' && (
-                  <div className="space-y-3 text-xs font-mono">
-                    <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                      <div className="text-slate-400 text-[11px] mb-1">Exponente de Vórtice Radial (n en Vθ · r^n = cte)</div>
-                      <input
-                        type="number"
-                        step="0.1"
-                        min="0.0"
-                        max="1.5"
-                        value={draft.geometry.freeVortexExponent}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value) || 1.0;
-                          updateDraft((p) => ({ ...p, geometry: { ...p.geometry, freeVortexExponent: val } }));
-                        }}
-                        className="w-full bg-slate-900 border border-slate-700 px-2 py-1 rounded text-cyan-300 focus:outline-none"
-                      />
-                      <span className="text-[10px] text-slate-500 mt-1 block">1.0 = Free Vortex canónico (dH0/dr = 0).</span>
-                    </div>
-                  </div>
-                )}
-
-                {/* 8. SANDBOX FREE EXPRESSION EVALUATOR */}
-                {selectedNode.editableType === 'sandbox' && (
-                  <div className="space-y-3 text-xs font-mono">
-                    <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 space-y-2">
-                      <div className="flex items-center justify-between text-slate-400 text-[11px]">
-                        <span>Expresión matemática (aritmética y funciones Math permitidas):</span>
-                        <span className="text-slate-500">Variables disponibles: eps, AR, turning, Rm, U, Va, PR, m_dot</span>
-                      </div>
-                      <textarea
-                        rows={2}
+                {editableType === 'sandbox' && (
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-col gap-2 rounded-lg border border-line bg-surface-muted p-3">
+                      <ExpressionField
+                        label="Expresión de prueba"
                         value={sandboxExpr}
-                        onChange={(e) => setSandboxExpr(e.target.value)}
-                        className="w-full bg-slate-900 border border-slate-700 px-2.5 py-1.5 rounded text-cyan-300 focus:outline-none focus:border-cyan-500 font-mono text-xs"
+                        onChange={(value) => {
+                          setSandboxExpr(value);
+                          setSandboxResult(null);
+                        }}
+                        multiline
+                        rows={2}
+                        hint={<VariableHint scope={SANDBOX_VARIABLES_SCOPE} note="Las pruebas no cambian el cálculo." />}
                       />
-                      <div className="flex items-center justify-between">
-                        <button
-                          onClick={testSandboxExpression}
-                          className="px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-semibold transition-colors flex items-center gap-1.5 shadow"
-                        >
-                          <Sparkles className="w-3.5 h-3.5" />
-                          <span>Evaluar Expresión en Vivo</span>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <button type="button" onClick={testSandboxExpression} disabled={!evalContext} className="btn-primary">
+                          <Sparkles className="h-4 w-4" aria-hidden="true" /> Evaluar con la etapa actual
                         </button>
+                        {!evalContext && <span className="text-caption text-ink-3">Necesita un diseño calculado.</span>}
                         {sandboxResult && (
-                          <div className={`px-2.5 py-1 rounded font-bold ${sandboxResult.error ? 'bg-rose-950/80 text-rose-300 border border-rose-800' : 'bg-emerald-950/80 text-emerald-300 border border-emerald-800'}`}>
-                            {sandboxResult.error ? sandboxResult.error : `Resultado = ${sandboxResult.value.toFixed(6)}`}
-                          </div>
+                          <span
+                            role="status"
+                            className={`rounded-lg border px-2.5 py-1 text-label font-semibold ${
+                              sandboxResult.error ? 'border-rose-200 bg-danger-soft text-danger' : 'border-emerald-200 bg-ok-soft text-ok'
+                            }`}
+                          >
+                            {sandboxResult.error ? sandboxResult.error : `Resultado = ${sandboxResult.value.toPrecision(6)}`}
+                          </span>
                         )}
                       </div>
                     </div>
-                    <div className="bg-slate-950 p-3 rounded-lg border border-purple-800/60 space-y-3">
+
+                    <div className="flex flex-col gap-3 rounded-lg border border-line p-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div>
-                          <h5 className="text-slate-100 font-semibold">Biblioteca de ecuaciones de usuario</h5>
-                          <p className="text-[11px] text-slate-400 mt-1">Añade expresiones, pruébalas con el punto actual y guárdalas dentro de un perfil.</p>
+                          <h5 className="text-body font-semibold text-ink">Biblioteca de ecuaciones de usuario</h5>
+                          <p className="text-caption text-ink-3">
+                            Añade expresiones, pruébalas con la etapa actual y guárdalas dentro de un perfil.
+                          </p>
                         </div>
-                        <button onClick={addUserEquation} className="px-3 py-1.5 rounded bg-purple-700 hover:bg-purple-600 text-white font-semibold flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5" /> Añadir ecuación
+                        <button type="button" onClick={addUserEquation} className="btn-secondary">
+                          <Plus className="h-4 w-4" aria-hidden="true" /> Añadir ecuación
                         </button>
                       </div>
-                      {draft.userEquations.length > 0 && (
+                      {selectedUserEquation && (
                         <>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <select
-                              value={selectedUserEquationId}
-                              onChange={(e) => setSelectedUserEquationId(e.target.value)}
-                              className="min-w-52 flex-1 bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-slate-100"
-                              aria-label="Seleccionar ecuación de usuario"
-                            >
-                              {draft.userEquations.map((equation) => <option key={equation.id} value={equation.id}>{equation.name}</option>)}
-                            </select>
-                            {selectedUserEquation && <button onClick={() => deleteUserEquation(selectedUserEquation.id)} className="px-2.5 py-2 rounded border border-rose-800 text-rose-300 hover:bg-rose-950 flex items-center gap-1"><Trash2 className="w-3.5 h-3.5" /> Eliminar ecuación</button>}
-                          </div>
-                          {selectedUserEquation && (
-                            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                              <label className="block space-y-1.5">
-                                <span className="text-[11px] text-slate-300">Nombre</span>
-                                <input value={selectedUserEquation.name} onChange={(e) => updateUserEquation(selectedUserEquation.id, { name: e.target.value })} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-slate-100" />
+                          <div className="flex flex-wrap items-end gap-2">
+                            <div className="flex min-w-52 flex-1 flex-col gap-1">
+                              <label htmlFor={userEquationSelectId} className="text-label font-medium text-ink-2">
+                                Ecuación de usuario
                               </label>
-                              <label className="block space-y-1.5">
-                                <span className="text-[11px] text-slate-300">Descripción</span>
-                                <input value={selectedUserEquation.description} onChange={(e) => updateUserEquation(selectedUserEquation.id, { description: e.target.value })} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-slate-100" />
-                              </label>
-                              <label className="block space-y-1.5 xl:col-span-2">
-                                <span className="text-[11px] text-slate-300">Expresión (se evalúa en tiempo real)</span>
-                                <textarea rows={2} value={selectedUserEquation.expression} onChange={(e) => updateUserEquation(selectedUserEquation.id, { expression: e.target.value })} className="w-full bg-slate-900 border border-slate-700 px-2.5 py-2 rounded text-cyan-200 font-mono text-xs" />
-                              </label>
-                              <div className="xl:col-span-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900 px-3 py-2">
-                                <span className="text-[11px] text-slate-400">Variables: eps, AR, turning, Rm, U, Va, PR, m_dot, phi, beta1, beta2, Mach, MachRel, dh_is_kJkg, eta_tt</span>
-                                {userEquationEvaluation && (
-                                  <span className={`font-mono text-xs font-semibold ${userEquationEvaluation.error ? 'text-rose-300' : 'text-emerald-300'}`}>
-                                    {userEquationEvaluation.error ? `Fórmula inválida: ${userEquationEvaluation.error}` : `Resultado de prueba: ${userEquationEvaluation.value.toPrecision(6)}`}
-                                  </span>
-                                )}
-                              </div>
-                              <p className="xl:col-span-2 text-[11px] text-amber-200/90 leading-relaxed">Estas ecuaciones se guardan y evalúan como pruebas independientes. Para que una ecuación nueva altere el diseño debe conectarse explícitamente a un modelo del solver; las expresiones personalizadas de Soderberg y A&amp;M sí están conectadas.</p>
+                              <select
+                                id={userEquationSelectId}
+                                value={selectedUserEquation.id}
+                                onChange={(event) => setSelectedUserEquationId(event.target.value)}
+                                className="field w-full max-sm:h-10 max-sm:text-base"
+                              >
+                                {draft.userEquations.map((equation) => (
+                                  <option key={equation.id} value={equation.id}>
+                                    {equation.name}
+                                  </option>
+                                ))}
+                              </select>
                             </div>
-                          )}
+                            <button
+                              type="button"
+                              onClick={() => deleteUserEquation(selectedUserEquation.id)}
+                              className="btn-secondary text-danger"
+                            >
+                              <Trash2 className="h-4 w-4" aria-hidden="true" /> Eliminar ecuación
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                            <PlainTextField
+                              label="Nombre"
+                              value={selectedUserEquation.name}
+                              onChange={(value) => updateUserEquation(selectedUserEquation.id, {name: value})}
+                            />
+                            <PlainTextField
+                              label="Descripción"
+                              value={selectedUserEquation.description}
+                              onChange={(value) => updateUserEquation(selectedUserEquation.id, {description: value})}
+                            />
+                            <ExpressionField
+                              className="xl:col-span-2"
+                              label="Expresión"
+                              value={selectedUserEquation.expression}
+                              onChange={(value) => updateUserEquation(selectedUserEquation.id, {expression: value})}
+                              multiline
+                              rows={2}
+                              hint={<VariableHint scope={USER_EQUATION_VARIABLES_SCOPE} />}
+                            />
+                            <p className="text-label xl:col-span-2" aria-live="polite">
+                              {!evalContext ? (
+                                <span className="text-ink-3">Sin diseño calculado: no hay valores de prueba.</span>
+                              ) : userEquationEvaluation?.error ? (
+                                <span className="text-danger">Fórmula no válida: {userEquationEvaluation.error}</span>
+                              ) : userEquationEvaluation ? (
+                                <span className="font-semibold tabular-nums text-ok">
+                                  Resultado de prueba: {userEquationEvaluation.value.toPrecision(6)}
+                                </span>
+                              ) : null}
+                            </p>
+                            <p className="text-caption leading-relaxed text-warn xl:col-span-2">
+                              Estas ecuaciones se guardan y se evalúan como pruebas independientes: no cambian el diseño. Las
+                              expresiones propias de Soderberg y Ainley-Mathieson sí están conectadas al solver.
+                            </p>
+                          </div>
                         </>
                       )}
                     </div>
                   </div>
                 )}
-              </div>
+              </section>
             )}
           </div>
         </div>
-
-        {/* --- FOOTER: SUMMARY & ACCEPT --- */}
-        <div className="px-5 py-3 bg-slate-900/90 border-t border-slate-800 flex items-center justify-between text-xs font-mono">
-          <div className="flex items-center gap-2 text-slate-400">
-            <Info className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Los parámetros y expresiones conectados se aplican en tiempo real; guarda un perfil para conservar este conjunto.</span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleResetToSafeDefaults}
-              className="px-3 py-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
-            >
-              Restablecer Todo
-            </button>
-            <button
-              onClick={onClose}
-              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-semibold transition-all shadow-md shadow-cyan-950"
-            >
-              Aceptar y Cerrar
-            </button>
-          </div>
-        </div>
       </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Auxiliares de render
+// ---------------------------------------------------------------------------
+
+/** Ámbitos usados solo para listar variables disponibles (los valores no importan). */
+const SANDBOX_VARIABLES_SCOPE: Scope = {eps: 0, AR: 0, turning: 0, Rm: 0, U: 0, Va: 0, PR: 0, m_dot: 0};
+const USER_EQUATION_VARIABLES_SCOPE: Scope = {
+  ...SANDBOX_VARIABLES_SCOPE,
+  phi: 0,
+  beta1: 0,
+  beta2: 0,
+  Mach: 0,
+  MachRel: 0,
+  dh_is_kJkg: 0,
+  eta_tt: 0,
+};
+
+function groupBySubfolder(nodes: EquationNode[]): {title: string; nodes: EquationNode[]}[] {
+  const map = new Map<string, EquationNode[]>();
+  nodes.forEach((node) => {
+    const list = map.get(node.subfolder);
+    if (list) list.push(node);
+    else map.set(node.subfolder, [node]);
+  });
+  return [...map.entries()].map(([title, items]) => ({title, nodes: items}));
+}
+
+function PlainTextField({label, value, onChange}: {label: string; value: string; onChange: (value: string) => void}) {
+  const id = useId();
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <label htmlFor={id} className="text-label font-medium text-ink-2">
+        {label}
+      </label>
+      <input id={id} value={value} onChange={(event) => onChange(event.target.value)} className="field w-full max-sm:h-10 max-sm:text-base" />
     </div>
   );
-};
+}
+
+
+export default EquationEditorModal;
