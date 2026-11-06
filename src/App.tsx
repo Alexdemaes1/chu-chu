@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from 'react';
+import { useState, useMemo, lazy, Suspense } from 'react';
 import {
   calculateMultiStageTurbine,
   GAS_PRESETS,
@@ -13,7 +13,9 @@ import {
 } from './utils/turbine1D';
 import { VelocityTrianglesSvg } from './components/VelocityTrianglesSvg';
 import { BaljeSmithCharts } from './components/BaljeSmithCharts';
-import { Rotor3DVisualizer } from './components/Rotor3DVisualizer';
+// Componentes pesados (three.js, canvas) en chunks aparte: la primera carga es más ligera.
+const Rotor3DVisualizer = lazy(() => import('./components/Rotor3DVisualizer').then((m) => ({ default: m.Rotor3DVisualizer })));
+const BladeProfileCanvas = lazy(() => import('./components/BladeProfileCanvas').then((m) => ({ default: m.BladeProfileCanvas })));
 import { TurbineDocumentationModal } from './components/TurbineDocumentationModal';
 import { EquationEditorModal } from './components/EquationEditorModal';
 import {
@@ -26,7 +28,7 @@ import {
 } from './utils/customEquations';
 import { calculateRadialEquilibriumBladeSections } from './utils/bladeGeometry';
 import { optimizeStageDesign, type DesignCandidate } from './utils/designOptimization';
-import { auditTurbomachineryDesign } from './utils/exportGeometry';
+import { auditTurbomachineryDesign, generateBladeCoordinatesCSV } from './utils/exportGeometry';
 import {
   Wind,
   Settings2,
@@ -954,6 +956,22 @@ export default function App() {
                   <span className="text-slate-500">Relación buje/punta (rotor)</span><strong className="text-right text-slate-800">{(radialBladeDesign.R_hub_mm / radialBladeDesign.R_tip_mm).toFixed(3)}</strong>
                   <span className="text-slate-500">Cierre pérdidas-geometría</span><strong className={`text-right ${currentStageResult.geometryLossConverged ? 'text-emerald-700' : 'text-amber-700'}`}>{currentStageResult.geometryLossConverged ? `Convergió · ${currentStageResult.geometryLossIterations} iter.` : `Límite · ${currentStageResult.geometryLossIterations} iter.`}</strong>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const csv = generateBladeCoordinatesCSV(radialBladeDesign);
+                    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+                    const anchor = document.createElement('a');
+                    anchor.href = url;
+                    anchor.download = `${currentStage.name.replace(/\s+/g, '_')}_coordenadas_alabe.csv`;
+                    anchor.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                  title="Coordenadas X, Y, Z de las secciones buje / medio / punta (ANSYS TurboGrid, OpenFOAM…)"
+                >
+                  Descargar coordenadas del álabe (CSV)
+                </button>
                 <p className="border-t border-slate-200 pt-2 text-[10px] leading-relaxed text-slate-500">El cierre recalcula alturas, cuerda, pérdidas y estados termodinámicos hasta converger. La vista 3D usa placas rectas extruidas, con espesor solo visual; no genera perfil aerodinámico ni torsión radial.</p>
               </div>
             )}
@@ -966,13 +984,16 @@ export default function App() {
         {/* PANEL 2: PANEL CENTRAL (VISUALIZADOR 3D THREE.JS ADAPTATIVO CON BARRA FLOTANTE DE HERRAMIENTAS) */}
         <section className="xl:col-span-6 flex flex-col gap-4 min-h-[520px] xl:min-h-[640px] min-w-0">
           {isDesignReady && radialBladeDesign ? (
-            <Rotor3DVisualizer
-              radialDesign={radialBladeDesign}
-              stageName={currentStage.name}
-              rpm={currentStage.N}
-              rotationDirection={currentStage.direction}
-              statorGeometry={statorCascadeGeometry ?? undefined}
-            />
+            <Suspense fallback={<div className="min-h-[460px] rounded-xl border border-slate-800 bg-slate-900/60 flex items-center justify-center text-sm text-slate-500">Cargando visor…</div>}>
+              <Rotor3DVisualizer
+                radialDesign={radialBladeDesign}
+                stageName={currentStage.name}
+                rpm={currentStage.N}
+                rotationDirection={currentStage.direction}
+                statorGeometry={statorCascadeGeometry ?? undefined}
+              />
+              <BladeProfileCanvas radialDesign={radialBladeDesign} stageName={currentStage.name} />
+            </Suspense>
           ) : (
             <div className="w-full h-full min-h-[460px] bg-slate-900/60 rounded-xl border border-slate-800 flex items-center justify-center p-6 text-center">
               <span className="text-sm text-slate-500">{isStageReady ? 'La geometría meridional y el modelo conceptual se calculan con el diseño actual.' : 'Introduce las condiciones de entrada y los parámetros de diseño para empezar.'}</span>

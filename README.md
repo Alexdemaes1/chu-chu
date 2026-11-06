@@ -49,7 +49,11 @@ src/
 
 ## Despliegue
 
-Desplegado en Vercel como sitio estático (Vite). Cada push a `main` despliega automáticamente.
+Sitio estático (Vite) en Vercel; la configuración está en `vercel.json`. Con el repo importado en Vercel,
+cada push a `main` despliega a producción y cada pull request genera una URL de previsualización.
+GitHub Actions ejecuta `npm run check` en cada push.
+
+Las tareas pendientes están en [CLAUDE.md](CLAUDE.md#pendientes-backlog-por-prioridad).
 
 ## Referencias
 
